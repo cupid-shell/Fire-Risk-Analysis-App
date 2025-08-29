@@ -1,0 +1,14 @@
+# Core Geospatial Libraries
+osmnx
+geopandas
+rasterio
+shapely
+geopy
+
+# App & Plotting
+streamlit
+matplotlib
+
+# Data Handling
+pandas
+numpy
