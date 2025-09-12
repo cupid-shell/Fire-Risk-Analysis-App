@@ -2,20 +2,16 @@ import streamlit as st
 from geopy.geocoders import Nominatim
 import streamlit.components.v1 as components
 
-# Import the main function from your analysis script
+
 from fire_risk_analyzer import main as run_analysis
 
-# --- App Layout ---
 st.set_page_config(layout="wide")
-# UPDATED: Added the (FRAT) acronym
 st.title("🔥 Fire Risk Analysis Tool (FRAT)")
 st.write("Enter the name of an urban settlement and select a radius to analyze its fire risk.")
 
-# --- Session State Initialization ---
 if 'maps_generated' not in st.session_state:
     st.session_state.maps_generated = False
 
-# --- User Inputs ---
 input_method = st.radio(
     "Choose input method:",
     ('Search by Name', 'Enter Coordinates')
@@ -46,7 +42,6 @@ with col2_weights:
 with col3_weights:
     water_weight = st.slider("Water Importance", 0, 100, 34)
 
-# --- Button and Analysis Logic ---
 if st.button("Analyze Location"):
     weights = {"density": (density_weight/100), "access": (access_weight/100), "water": (water_weight/100)}
     total_weight = sum(weights.values())
@@ -80,7 +75,6 @@ if st.button("Analyze Location"):
             except Exception as e:
                 st.error(f"An error occurred during analysis: {e}"); st.exception(e)
 
-# --- Persistent Display Area ---
 if st.session_state.maps_generated:
     st.markdown("---")
     st.subheader("Download Full Report")
@@ -109,6 +103,5 @@ if st.session_state.maps_generated:
     except FileNotFoundError:
         st.error("Interactive map file not found. Please run the analysis again.")
     
-    # --- NEW: Creator Credit ---
     st.markdown("---")
     st.caption("Created by Avishek Adhikari | avishek.jidpus@gmail.com")
