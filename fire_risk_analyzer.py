@@ -25,12 +25,12 @@ def get_geospatial_data(location_point, distance, target_crs):
         print(f"Could not download road network. Error: {e}")
         return [None] * 5
 
-    # --- THIS IS THE FIX: Reverting to a more general error handling ---
+
     try:
         tags = {"building": True}
         buildings = ox.features_from_point(location_point, tags, dist=distance)
         buildings_proj = buildings.to_crs(target_crs)
-    except Exception: # Use a general Exception
+    except Exception: 
         print("Warning: No buildings found in the area. Creating empty buildings dataset.")
         buildings_proj = gpd.GeoDataFrame(columns=['geometry'], crs=target_crs)
 
@@ -38,7 +38,7 @@ def get_geospatial_data(location_point, distance, target_crs):
         water_tags = {"natural": "water", "amenity": "fire_hydrant"}
         water_sources = ox.features_from_point(location_point, water_tags, dist=distance)
         water_sources_proj = water_sources.to_crs(target_crs)
-    except Exception: # Use a general Exception
+    except Exception: 
         print("Warning: No water sources found in the area. Creating empty water sources dataset.")
         water_sources_proj = gpd.GeoDataFrame(columns=['geometry'], crs=target_crs)
 
@@ -46,14 +46,14 @@ def get_geospatial_data(location_point, distance, target_crs):
         station_tags = {"amenity": "fire_station"}
         fire_stations = ox.features_from_point(location_point, station_tags, dist=distance)
         fire_stations_proj = fire_stations.to_crs(target_crs)
-    except Exception: # Use a general Exception
+    except Exception: 
         print("Warning: No fire stations found in the area. Creating empty fire stations dataset.")
         fire_stations_proj = gpd.GeoDataFrame(columns=['geometry'], crs=target_crs)
 
     print("Data fetching complete!")
     return graph_proj, buildings_proj, accessible_roads, water_sources_proj, fire_stations_proj
 
-# (All other functions in the script remain the same)
+
 def calculate_density_grid(buildings_proj, cell_size=50):
     if buildings_proj.empty:
         print("No buildings to process for density grid.")
