@@ -1,14 +1,22 @@
-# Core Geospatial Libraries
+# Core Geospatial & Analysis
 osmnx
 geopandas
-rasterio
-shapely
+scipy
+networkx
+
+# Web App & Interactivity
+streamlit
+streamlit-folium
+folium
+branca
 geopy
 
-# App & Plotting
-streamlit
-matplotlib
+# PDF Reporting
+fpdf2
 
 # Data Handling
 pandas
 numpy
+
+# Plotting
+matplotlib
