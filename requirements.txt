@@ -11,9 +11,6 @@ folium
 branca
 geopy
 
-# PDF Reporting
-fpdf2
-
 # Data Handling
 pandas
 numpy

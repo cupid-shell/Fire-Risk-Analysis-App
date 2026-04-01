@@ -8,29 +8,34 @@ from scipy.interpolate import griddata
 import folium
 import branca.colormap as cm
 import networkx as nx
-from fpdf import FPDF
 
-def get_geospatial_data(location_point, distance, target_crs):
+# Prevent osmnx from hanging indefinitely on slow/unresponsive OSM servers
+ox.settings.requests_timeout = 180
+
+DEFAULT_ROAD_TYPES = ['primary', 'secondary', 'tertiary', 'residential', 'service', 'unclassified']
+
+def get_geospatial_data(location_point, distance, target_crs, road_types=None):
     """
     Downloads and projects all necessary data, handling cases where features are not found.
     """
+    if road_types is None:
+        road_types = DEFAULT_ROAD_TYPES
+
     print(f"Fetching data within {distance}m of {location_point}...")
     try:
         graph = ox.graph_from_point(location_point, dist=distance, network_type='all')
         graph_proj = ox.project_graph(graph, to_crs=target_crs)
         edges = ox.graph_to_gdfs(graph_proj, nodes=False)
-        road_types = ['primary', 'secondary', 'tertiary', 'residential', 'service', 'unclassified']
         accessible_roads = edges[edges['highway'].isin(road_types)]
     except Exception as e:
         print(f"Could not download road network. Error: {e}")
         return [None] * 5
 
-
     try:
         tags = {"building": True}
         buildings = ox.features_from_point(location_point, tags, dist=distance)
         buildings_proj = buildings.to_crs(target_crs)
-    except Exception: 
+    except Exception:
         print("Warning: No buildings found in the area. Creating empty buildings dataset.")
         buildings_proj = gpd.GeoDataFrame(columns=['geometry'], crs=target_crs)
 
@@ -38,7 +43,7 @@ def get_geospatial_data(location_point, distance, target_crs):
         water_tags = {"natural": "water", "amenity": "fire_hydrant"}
         water_sources = ox.features_from_point(location_point, water_tags, dist=distance)
         water_sources_proj = water_sources.to_crs(target_crs)
-    except Exception: 
+    except Exception:
         print("Warning: No water sources found in the area. Creating empty water sources dataset.")
         water_sources_proj = gpd.GeoDataFrame(columns=['geometry'], crs=target_crs)
 
@@ -46,7 +51,7 @@ def get_geospatial_data(location_point, distance, target_crs):
         station_tags = {"amenity": "fire_station"}
         fire_stations = ox.features_from_point(location_point, station_tags, dist=distance)
         fire_stations_proj = fire_stations.to_crs(target_crs)
-    except Exception: 
+    except Exception:
         print("Warning: No fire stations found in the area. Creating empty fire stations dataset.")
         fire_stations_proj = gpd.GeoDataFrame(columns=['geometry'], crs=target_crs)
 
@@ -77,14 +82,25 @@ def calculate_density_grid(buildings_proj, cell_size=50):
     print("Density calculation complete!")
     return grid
 
-def calculate_travel_risk(buildings_proj, fire_stations_proj, graph_proj):
+def calculate_travel_risk(buildings_proj, fire_stations_proj, graph_proj, extra_station=None):
     print("Calculating travel distance risk from fire stations...")
-    if fire_stations_proj.empty:
+    stations = fire_stations_proj.copy()
+
+    if extra_station is not None:
+        target_crs = stations.crs if not stations.empty else buildings_proj.crs
+        extra_pt = gpd.GeoDataFrame(
+            geometry=[Point(extra_station[1], extra_station[0])],
+            crs="EPSG:4326"
+        ).to_crs(target_crs)
+        stations = pd.concat([stations, extra_pt], ignore_index=True) if not stations.empty else extra_pt
+
+    if stations.empty:
         print("No fire stations found. Assigning high-risk distance.")
         buildings_with_risk = buildings_proj.copy()
         buildings_with_risk['travel_distance'] = 5000
         return buildings_with_risk
-    fire_station_points = fire_stations_proj.copy()
+
+    fire_station_points = stations.copy()
     fire_station_points['geometry'] = fire_station_points.geometry.centroid
     station_nodes = ox.nearest_nodes(graph_proj, fire_station_points.geometry.x, fire_station_points.geometry.y)
     building_nodes = ox.nearest_nodes(graph_proj, buildings_proj.geometry.centroid.x, buildings_proj.geometry.centroid.y)
@@ -197,70 +213,22 @@ def generate_interactive_risk_map(grid):
     m.add_child(colormap); folium.LayerControl().add_to(m)
     m.save('interactive_risk_map.html')
 
-def generate_pdf_report(place_name, search_dist, weights, final_risk_grid):
-    print("Generating PDF report...")
-    if final_risk_grid.empty:
-        print("Cannot generate report: risk grid is empty.")
-        return
-    top_5_hotspots = final_risk_grid.nlargest(5, 'final_risk')
-    top_5_hotspots_wgs84 = top_5_hotspots.to_crs("EPSG:4326")
-    top_5_hotspots_wgs84['lon'] = top_5_hotspots_wgs84.centroid.x
-    top_5_hotspots_wgs84['lat'] = top_5_hotspots_wgs84.centroid.y
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font('Arial', 'B', 16)
-    pdf.cell(0, 10, f'Fire Risk Analysis Report: {place_name}', 0, 1, 'C')
-    pdf.ln(10)
-    pdf.set_font('Arial', 'B', 12)
-    pdf.cell(0, 10, 'Analysis Parameters', 0, 1)
-    pdf.set_font('Arial', '', 10)
-    pdf.cell(0, 5, f"- Search Radius: {search_dist} meters", 0, 1)
-    pdf.cell(0, 5, f"- Risk Weights: Density ({weights['density']:.0%}), Access ({weights['access']:.0%}), Water ({weights['water']:.0%})", 0, 1)
-    pdf.ln(5)
-    pdf.set_font('Arial', 'B', 12)
-    pdf.cell(0, 10, 'Composite Fire Risk Map', 0, 1)
-    pdf.image('final_risk_map.png', x=10, y=None, w=190)
-    pdf.ln(5)
-    pdf.add_page()
-    pdf.set_font('Arial', 'B', 12)
-    pdf.cell(0, 10, 'Top 5 Highest-Risk Zones', 0, 1)
-    pdf.set_font('Arial', 'B', 10)
-    pdf.cell(20, 10, 'Rank', 1)
-    pdf.cell(50, 10, 'Latitude', 1)
-    pdf.cell(50, 10, 'Longitude', 1)
-    pdf.cell(40, 10, 'Risk Score', 1)
-    pdf.ln()
-    pdf.set_font('Arial', '', 10)
-    rank = 1
-    for index, row in top_5_hotspots_wgs84.iterrows():
-        lat = f"{row['lat']:.5f}"
-        lon = f"{row['lon']:.5f}"
-        score = f"{row['final_risk']:.3f}"
-        pdf.cell(20, 10, str(rank), 1)
-        pdf.cell(50, 10, lat, 1)
-        pdf.cell(50, 10, lon, 1)
-        pdf.cell(40, 10, score, 1)
-        pdf.ln()
-        rank += 1
-    pdf.output("Fire_Risk_Report.pdf")
-    print("PDF report saved as 'Fire_Risk_Report.pdf'")
-
-def main(place_name, location_point, search_distance, weights):
-    """Orchestrates the entire analysis and map generation."""
+def main(place_name, location_point, search_distance, weights, road_types=None, extra_station=None):
+    """Orchestrates the entire analysis and map generation. Returns the final risk grid."""
     gdf_wgs84 = gpd.GeoDataFrame(geometry=[Point(location_point[1], location_point[0])], crs="EPSG:4326")
     target_crs = gdf_wgs84.estimate_utm_crs()
-    graph, buildings, accessible_roads, water_sources, fire_stations = get_geospatial_data(location_point, search_distance, target_crs)
+    graph, buildings, accessible_roads, water_sources, fire_stations = get_geospatial_data(location_point, search_distance, target_crs, road_types)
     if graph is None or buildings.empty:
         raise ValueError("No buildings or road network found. Cannot generate analysis.")
     density_grid = calculate_density_grid(buildings)
-    buildings_with_travel_risk = calculate_travel_risk(buildings, fire_stations, graph)
+    buildings_with_travel_risk = calculate_travel_risk(buildings, fire_stations, graph, extra_station)
     buildings_with_all_risks = calculate_water_risk(buildings_with_travel_risk, water_sources)
     final_risk_grid = calculate_composite_risk(density_grid, buildings_with_all_risks, weights)
     save_footprints_map(buildings, graph, 'building_footprints.png')
     save_roads_map(accessible_roads, graph, 'road_network.png')
     generate_static_risk_map(final_risk_grid, graph)
     generate_interactive_risk_map(final_risk_grid)
-    generate_pdf_report(place_name, search_distance, weights, final_risk_grid)
+    return final_risk_grid
 
 if __name__ == "__main__":
     test_place = "Korail, Dhaka"
