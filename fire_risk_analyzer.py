@@ -426,7 +426,7 @@ def generate_interactive_risk_map(grid, fire_stations_proj=None, water_sources_p
 
     # Heatmap layer
     heat_data = [
-        [row.centroid.y, row.centroid.x, row['final_risk']]
+        [row.geometry.centroid.y, row.geometry.centroid.x, row['final_risk']]
         for _, row in grid_wgs84[grid_wgs84['n_buildings'] > 0].iterrows()
     ]
     if heat_data:
