@@ -6,6 +6,7 @@ from shapely.geometry import Point, Polygon
 import matplotlib.pyplot as plt
 from scipy.interpolate import griddata
 import folium
+import folium.plugins
 import branca.colormap as cm
 import networkx as nx
 
@@ -128,6 +129,42 @@ def calculate_water_risk(buildings_proj, water_sources_proj):
     print("Water risk calculation complete!")
     return buildings_with_risk
 
+def calculate_hazard_risk(buildings_proj, hazards_proj):
+    """Proximity to hazard points (gas stations, hospitals, schools) — closer = higher risk."""
+    b = buildings_proj.copy()
+    if hazards_proj is None or hazards_proj.empty:
+        b['distance_to_hazard'] = 2000
+        return b
+    combined = hazards_proj.union_all()
+    b['distance_to_hazard'] = b.geometry.apply(lambda g: g.centroid.distance(combined))
+    return b
+
+def calculate_occupancy_modifier(buildings_proj):
+    """Estimates occupancy from floor count × footprint area. Used to boost density risk."""
+    b = buildings_proj.copy()
+    levels = b['levels'] if 'levels' in b.columns else pd.Series(1.0, index=b.index)
+    b['occupancy_proxy'] = (levels * b.geometry.area / 25.0).clip(lower=1)
+    return b
+
+def calculate_road_width_modifier(density_grid, accessible_roads):
+    """Cells with fewer-lane roads get a narrow-road access penalty."""
+    grid = density_grid.copy()
+    if accessible_roads is None or accessible_roads.empty:
+        grid['avg_lanes'] = 2.0
+        return grid
+    roads = accessible_roads.copy()
+    def _parse_lanes(v):
+        if isinstance(v, list): v = v[0]
+        try: return float(v)
+        except: return 1.0
+    roads['lanes_num'] = roads['lanes'].apply(_parse_lanes) if 'lanes' in roads.columns else 1.0
+    road_pts = roads[['geometry', 'lanes_num']].copy()
+    road_pts['geometry'] = road_pts.geometry.centroid
+    joined = gpd.sjoin(road_pts, grid.reset_index(), how='left', predicate='within')
+    avg = joined.groupby('index_right')['lanes_num'].mean()
+    grid['avg_lanes'] = avg.reindex(grid.index).fillna(2.0)
+    return grid
+
 def apply_wind_modifier(risk_grid, wind_direction_deg):
     """
     Applies a directional wind multiplier to final_risk.
@@ -167,6 +204,7 @@ def calculate_height_risk(buildings_proj):
 def calculate_composite_risk(density_grid, buildings_with_all_risks, weights):
     print("Calculating composite risk score...")
     grid = density_grid.reset_index(drop=True)
+
     if buildings_with_all_risks.empty or 'travel_distance' not in buildings_with_all_risks.columns:
         grid['avg_travel_distance'] = 0
         grid['avg_distance_water'] = 0
@@ -175,46 +213,65 @@ def calculate_composite_risk(density_grid, buildings_with_all_risks, weights):
         buildings_centroids['geometry'] = buildings_centroids.geometry.centroid
         merged = gpd.sjoin(buildings_centroids, grid, how='left', predicate='within')
         agg_cols = ['travel_distance', 'distance_to_water']
-        if 'levels' in buildings_centroids.columns:
-            agg_cols.append('levels')
+        for col in ['levels', 'distance_to_hazard', 'occupancy_proxy']:
+            if col in buildings_centroids.columns:
+                agg_cols.append(col)
         avg_risks_in_grid = merged.groupby('index_right')[agg_cols].mean()
         grid = grid.join(avg_risks_in_grid)
+
     grid = grid.rename(columns={'travel_distance': 'avg_travel_distance', 'distance_to_water': 'avg_distance_water'})
-    grid['avg_travel_distance'] = grid['avg_travel_distance'].fillna(0)
-    grid['avg_distance_water'] = grid['avg_distance_water'].fillna(0)
-    if not grid.empty and (grid['n_buildings'].max() - grid['n_buildings'].min()) > 0:
-        grid['density_risk'] = (grid['n_buildings'] - grid['n_buildings'].min()) / (grid['n_buildings'].max() - grid['n_buildings'].min())
-    else: grid['density_risk'] = 0
-    if not grid.empty and (grid['avg_travel_distance'].max() - grid['avg_travel_distance'].min()) > 0:
-        grid['access_risk'] = (grid['avg_travel_distance'] - grid['avg_travel_distance'].min()) / (grid['avg_travel_distance'].max() - grid['avg_travel_distance'].min())
-    else: grid['access_risk'] = 0
-    if not grid.empty and (grid['avg_distance_water'].max() - grid['avg_distance_water'].min()) > 0:
-        grid['water_risk'] = (grid['avg_distance_water'] - grid['avg_distance_water'].min()) / (grid['avg_distance_water'].max() - grid['avg_distance_water'].min())
-    else: grid['water_risk'] = 0
+    for col in ['avg_travel_distance', 'avg_distance_water']:
+        grid[col] = grid[col].fillna(0)
+
+    def _norm(series):
+        mn, mx = series.min(), series.max()
+        return (series - mn) / (mx - mn) if mx > mn else pd.Series(0.0, index=series.index)
+
+    grid['density_risk'] = _norm(grid['n_buildings'])
+
+    # Occupancy modifier — boosts density risk by up to 50% for high-occupancy buildings
+    if 'occupancy_proxy' in grid.columns:
+        grid['occupancy_proxy'] = grid['occupancy_proxy'].fillna(1)
+        occ_norm = _norm(grid['occupancy_proxy'])
+        grid['density_risk'] = (grid['density_risk'] * (1 + occ_norm * 0.5)).clip(0, 1)
+
+    grid['access_risk'] = _norm(grid['avg_travel_distance'])
+
+    # Road width modifier — narrow roads boost access risk by up to 30%
+    if 'avg_lanes' in grid.columns:
+        grid['avg_lanes'] = grid['avg_lanes'].fillna(2)
+        narrow_penalty = (1 / grid['avg_lanes'].clip(lower=0.5)).pipe(_norm)
+        grid['access_risk'] = (grid['access_risk'] * (1 + narrow_penalty * 0.3)).clip(0, 1)
+
+    grid['water_risk'] = _norm(grid['avg_distance_water'])
 
     if 'levels' in grid.columns and weights.get('height', 0) > 0:
         grid['levels'] = grid['levels'].fillna(1)
-        if (grid['levels'].max() - grid['levels'].min()) > 0:
-            grid['height_risk'] = (grid['levels'] - grid['levels'].min()) / (grid['levels'].max() - grid['levels'].min())
-        else:
-            grid['height_risk'] = 0
+        grid['height_risk'] = _norm(grid['levels'])
     else:
-        grid['height_risk'] = 0
+        grid['height_risk'] = 0.0
+
+    if 'distance_to_hazard' in grid.columns and weights.get('hazard', 0) > 0:
+        grid['distance_to_hazard'] = grid['distance_to_hazard'].fillna(2000)
+        grid['hazard_risk'] = _norm(-grid['distance_to_hazard'])  # closer = higher risk
+    else:
+        grid['hazard_risk'] = 0.0
 
     grid['final_risk'] = (
         grid['density_risk'] * weights.get('density', 0) +
-        grid['access_risk']  * weights.get('access', 0) +
-        grid['water_risk']   * weights.get('water', 0) +
-        grid['height_risk']  * weights.get('height', 0)
-    )
+        grid['access_risk']  * weights.get('access',  0) +
+        grid['water_risk']   * weights.get('water',   0) +
+        grid['height_risk']  * weights.get('height',  0) +
+        grid['hazard_risk']  * weights.get('hazard',  0)
+    ).clip(0, 1)
 
-    def classify_risk(score):
-        if score >= 0.75:   return 'Critical'
-        elif score >= 0.50: return 'High'
-        elif score >= 0.25: return 'Medium'
-        else:               return 'Low'
+    def _band(s):
+        if s >= 0.75: return 'Critical'
+        if s >= 0.50: return 'High'
+        if s >= 0.25: return 'Medium'
+        return 'Low'
 
-    grid['risk_band'] = grid['final_risk'].apply(classify_risk)
+    grid['risk_band'] = grid['final_risk'].apply(_band)
     return grid
 
 def save_footprints_map(buildings, graph, filepath):
@@ -263,11 +320,19 @@ def generate_static_risk_map(grid, graph):
     fig.savefig('final_risk_map.png', dpi=300, bbox_inches='tight', pad_inches=0, facecolor='#060606')
     plt.close(fig)
 
-def generate_interactive_risk_map(grid, fire_stations_proj=None, water_sources_proj=None, extra_station=None):
+def generate_interactive_risk_map(grid, fire_stations_proj=None, water_sources_proj=None, extra_station=None, accessible_roads=None):
     print("Generating interactive risk map...")
     grid_wgs84 = grid.to_crs("EPSG:4326")
     map_center = [grid_wgs84.centroid.y.mean(), grid_wgs84.centroid.x.mean()]
     m = folium.Map(location=map_center, zoom_start=15, tiles="CartoDB positron")
+
+    # Satellite base layer
+    folium.TileLayer(
+        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        attr='Esri World Imagery',
+        name='Satellite',
+        overlay=False
+    ).add_to(m)
 
     colormap = cm.LinearColormap(colors=['green', 'yellow', 'red'], vmin=grid['final_risk'].min(), vmax=grid['final_risk'].max())
     colormap.caption = 'Composite Fire Risk Score'
@@ -344,6 +409,42 @@ def generate_interactive_risk_map(grid, fire_stations_proj=None, water_sources_p
                 ).add_to(ring_layer)
         ring_layer.add_to(m)
 
+    # Heatmap layer
+    heat_data = [
+        [row.centroid.y, row.centroid.x, row['final_risk']]
+        for _, row in grid_wgs84[grid_wgs84['n_buildings'] > 0].iterrows()
+    ]
+    if heat_data:
+        heatmap_layer = folium.FeatureGroup(name="Risk Heatmap (smooth)")
+        folium.plugins.HeatMap(heat_data, radius=20, blur=15, min_opacity=0.3).add_to(heatmap_layer)
+        heatmap_layer.add_to(m)
+
+    # Road risk overlay
+    if accessible_roads is not None and not accessible_roads.empty:
+        try:
+            roads_wgs84 = accessible_roads.to_crs("EPSG:4326").copy()
+            grid_pts = grid_wgs84[['geometry', 'final_risk']].copy()
+            grid_pts['geometry'] = grid_pts.geometry.centroid
+            road_sample = roads_wgs84.iloc[::max(1, len(roads_wgs84)//400)]  # cap at ~400 segments
+            road_mids = road_sample.copy()
+            road_mids['geometry'] = road_mids.geometry.centroid
+            joined = gpd.sjoin_nearest(road_mids[['geometry']], grid_pts, how='left')
+            road_sample = road_sample.copy()
+            road_sample['road_risk'] = joined['final_risk'].values
+            road_cmap = cm.LinearColormap(colors=['green', 'yellow', 'red'], vmin=0, vmax=1)
+            road_layer = folium.FeatureGroup(name="Road Risk Overlay")
+            for _, row in road_sample.iterrows():
+                risk = float(row.get('road_risk') or 0)
+                try:
+                    coords = [(pt[1], pt[0]) for pt in row.geometry.coords]
+                    folium.PolyLine(coords, color=road_cmap(risk), weight=3, opacity=0.75,
+                                   tooltip=f"Road Risk: {risk:.3f}").add_to(road_layer)
+                except Exception:
+                    pass
+            road_layer.add_to(m)
+        except Exception as e:
+            print(f"Road overlay skipped: {e}")
+
     m.add_child(colormap)
     folium.LayerControl(collapsed=False).add_to(m)
     m.save('interactive_risk_map.html')
@@ -357,14 +458,17 @@ def main(place_name, location_point, search_distance, weights, road_types=None, 
         raise ValueError("No buildings or road network found. Cannot generate analysis.")
     density_grid = calculate_density_grid(buildings)
     buildings_with_heights = calculate_height_risk(buildings)
-    buildings_with_travel_risk = calculate_travel_risk(buildings_with_heights, fire_stations, graph, extra_station)
-    buildings_with_all_risks = calculate_water_risk(buildings_with_travel_risk, water_sources)
+    buildings_with_occ = calculate_occupancy_modifier(buildings_with_heights)
+    buildings_with_travel_risk = calculate_travel_risk(buildings_with_occ, fire_stations, graph, extra_station)
+    buildings_with_water = calculate_water_risk(buildings_with_travel_risk, water_sources)
+    buildings_with_all_risks = calculate_hazard_risk(buildings_with_water, None)
+    density_grid = calculate_road_width_modifier(density_grid, accessible_roads)
     final_risk_grid = calculate_composite_risk(density_grid, buildings_with_all_risks, weights)
     final_risk_grid = apply_wind_modifier(final_risk_grid, wind_direction)
     save_footprints_map(buildings, graph, 'building_footprints.png')
     save_roads_map(accessible_roads, graph, 'road_network.png')
     generate_static_risk_map(final_risk_grid, graph)
-    generate_interactive_risk_map(final_risk_grid, fire_stations, water_sources, extra_station)
+    generate_interactive_risk_map(final_risk_grid, fire_stations, water_sources, extra_station, accessible_roads)
     return final_risk_grid
 
 if __name__ == "__main__":

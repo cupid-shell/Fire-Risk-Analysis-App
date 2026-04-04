@@ -17,3 +17,10 @@ numpy
 
 # Plotting
 matplotlib
+
+# Export
+simplekml
+
+# API endpoint (optional)
+fastapi
+uvicorn

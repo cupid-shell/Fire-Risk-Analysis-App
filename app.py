@@ -1,21 +1,22 @@
 import streamlit as st
 from geopy.geocoders import Nominatim
 import streamlit.components.v1 as components
-from streamlit_folium import st_folium
+from streamlit_folium import st_folium as _st_folium
 import geopandas as gpd
 from shapely.geometry import Point
 import pandas as pd
-import json
-import os
-import datetime
+import json, os, io, zipfile, datetime
+from concurrent.futures import ThreadPoolExecutor
 
 from fire_risk_analyzer import (
-    get_geospatial_data,
     calculate_density_grid,
     calculate_height_risk,
+    calculate_occupancy_modifier,
+    calculate_hazard_risk,
     calculate_travel_risk,
     calculate_water_risk,
     calculate_composite_risk,
+    calculate_road_width_modifier,
     apply_wind_modifier,
     save_footprints_map,
     save_roads_map,
@@ -24,527 +25,651 @@ from fire_risk_analyzer import (
     DEFAULT_ROAD_TYPES,
 )
 
-st.set_page_config(layout="wide")
-st.title("Fire Risk Analysis Tool (FRAT)")
-st.write("Enter the name of an urban settlement and select a radius to analyze its fire risk.")
+# ── Page config ───────────────────────────────────────────────────────────────
+st.set_page_config(layout="wide", page_title="FRAT – Fire Risk Analysis Tool")
 
-# --- Session state ---
-for _key, _default in [('maps_generated', False), ('final_risk_grid', None), ('location_query', ''), ('scenario_a', None), ('scenario_b', None)]:
-    if _key not in st.session_state:
-        st.session_state[_key] = _default
+# ── Guided tour ───────────────────────────────────────────────────────────────
+with st.expander("👋 New here? Click for a quick guide", expanded=False):
+    st.markdown("""
+**How to use FRAT in 4 steps:**
 
-# --- Read URL params (shareable links) ---
+1. **Enter a location** — type a place name (e.g. *Korail, Dhaka*) or switch to coordinate mode.
+2. **Set radius & weights** — choose how large an area to analyse and how much each risk factor matters.
+3. **Advanced Options** (optional) — filter road types, add a hypothetical fire station, enable wind direction, or set a hazard weight.
+4. **Click Analyse Location** — maps, stats, hotspot table, and exports all appear below.
+
+**Risk bands:** 🟢 Low · 🟡 Medium · 🔴 High · ⛔ Critical
+**Tip:** Run two analyses with different weights to use the *Scenario Comparison* section.
+    """)
+
+st.title("🔥 Fire Risk Analysis Tool (FRAT)")
+st.write("Geospatial fire-risk scoring for urban settlements using OpenStreetMap data.")
+
+# ── Reset button ──────────────────────────────────────────────────────────────
+if st.button("↺ Reset to Defaults", help="Clear all results and reset inputs"):
+    for k in ['maps_generated', 'final_risk_grid', 'location_query',
+              'scenario_a', 'scenario_b', 'last_location_point', 'last_accessible_roads']:
+        st.session_state[k] = None if k not in ('maps_generated',) else False
+    st.rerun()
+
+# ── Session state ─────────────────────────────────────────────────────────────
+_defaults = {
+    'maps_generated': False, 'final_risk_grid': None, 'location_query': '',
+    'scenario_a': None, 'scenario_b': None,
+    'last_location_point': None, 'last_accessible_roads': None,
+}
+for k, v in _defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ── URL params ────────────────────────────────────────────────────────────────
 _qp = st.query_params
-_default_name = _qp.get("loc", "Korail, Dhaka")
-_default_radius = int(_qp.get("r", 1000))
+_default_name   = _qp.get("loc",    "Korail, Dhaka")
+_default_radius = int(_qp.get("r",  1000))
 _default_method = _qp.get("method", "Search by Name")
 
-# --- Input ---
-input_method = st.radio("Choose input method:", ('Search by Name', 'Enter Coordinates'), index=0 if _default_method == 'Search by Name' else 1)
-
+# ── Input ─────────────────────────────────────────────────────────────────────
+input_method = st.radio("Choose input method:", ('Search by Name', 'Enter Coordinates'),
+                        index=0 if _default_method == 'Search by Name' else 1)
 location_query = ""
 location_point = None
 
 if input_method == 'Search by Name':
-    location_query = st.text_input("Enter Location Name (e.g., 'Korail, Dhaka')", _default_name)
+    location_query = st.text_input("Enter Location Name (e.g. 'Korail, Dhaka')", _default_name)
 else:
-    _default_lat = float(_qp.get("lat", 23.774))
-    _default_lon = float(_qp.get("lon", 90.405))
-    lat_col, lon_col = st.columns(2)
-    with lat_col:
-        lat = st.number_input("Enter Latitude", value=_default_lat, min_value=-90.0, max_value=90.0, step=0.001, format="%.5f")
-    with lon_col:
-        lon = st.number_input("Enter Longitude", value=_default_lon, min_value=-180.0, max_value=180.0, step=0.001, format="%.5f")
+    _dlat = float(_qp.get("lat", 23.774))
+    _dlon = float(_qp.get("lon", 90.405))
+    lc1, lc2 = st.columns(2)
+    with lc1:
+        lat = st.number_input("Latitude",  value=_dlat, min_value=-90.0,  max_value=90.0,  step=0.001, format="%.5f")
+    with lc2:
+        lon = st.number_input("Longitude", value=_dlon, min_value=-180.0, max_value=180.0, step=0.001, format="%.5f")
     location_point = (lat, lon)
     location_query = f"{lat:.5f}, {lon:.5f}"
 
-search_dist = st.slider("Select Search Radius (meters)", 500, 2500, _default_radius, 50)
+search_dist = st.slider("Search Radius (metres)", 500, 2500, _default_radius, 50)
 
-# --- Risk weights ---
+# ── Weights ───────────────────────────────────────────────────────────────────
 st.subheader("Adjust Risk Factor Weights")
-col1_w, col2_w, col3_w, col4_w = st.columns(4)
-with col1_w:
-    density_weight = st.slider("Density Importance", 0, 100, 33)
-with col2_w:
-    access_weight = st.slider("Access Importance", 0, 100, 33)
-with col3_w:
-    water_weight = st.slider("Water Importance", 0, 100, 24)
-with col4_w:
-    height_weight = st.slider("Height Importance", 0, 100, 10, help="Uses building floor count (building:levels) from OSM. Set to 0 if data is sparse.")
+w1, w2, w3, w4, w5 = st.columns(5)
+with w1: density_weight = st.slider("Density",  0, 100, 30)
+with w2: access_weight  = st.slider("Access",   0, 100, 25)
+with w3: water_weight   = st.slider("Water",    0, 100, 20)
+with w4: height_weight  = st.slider("Height",   0, 100, 10, help="Uses building floor count from OSM.")
+with w5: hazard_weight  = st.slider("Hazard",   0, 100, 15, help="Proximity to gas stations, hospitals, schools.")
 
-# --- Advanced options ---
-ALL_ROAD_TYPES = [
-    'primary', 'secondary', 'tertiary', 'residential',
-    'service', 'unclassified', 'trunk', 'living_street', 'pedestrian', 'track'
-]
+# ── Advanced Options ──────────────────────────────────────────────────────────
+ALL_ROAD_TYPES = ['primary','secondary','tertiary','residential','service',
+                  'unclassified','trunk','living_street','pedestrian','track']
 
-with st.expander("Advanced Options"):
+with st.expander("⚙ Advanced Options"):
     st.markdown("**Road Type Filter**")
-    st.caption("Select which road types count toward fire station accessibility scoring.")
-    selected_road_types = st.multiselect(
-        "Included road types:",
-        options=ALL_ROAD_TYPES,
-        default=DEFAULT_ROAD_TYPES,
-    )
+    selected_road_types = st.multiselect("Included road types:", ALL_ROAD_TYPES, default=DEFAULT_ROAD_TYPES)
 
     st.markdown("---")
     st.markdown("**Wind Direction Modifier**")
-    st.caption("Downwind cells receive up to +20% risk boost. Direction is where wind blows FROM (0°=N, 90°=E, 180°=S, 270°=W).")
-    enable_wind = st.checkbox("Enable wind direction modifier")
+    st.caption("Downwind cells get up to +20 % risk boost. Direction = where wind blows FROM.")
+    enable_wind = st.checkbox("Enable wind modifier")
     wind_direction = None
     if enable_wind:
-        wind_direction = st.slider("Wind direction (degrees FROM)", 0, 359, 0, help="0=North, 90=East, 180=South, 270=West")
-        compass = {0: "N", 45: "NE", 90: "E", 135: "SE", 180: "S", 225: "SW", 270: "W", 315: "NW"}
-        nearest = min(compass.keys(), key=lambda k: abs(k - wind_direction))
-        st.caption(f"Wind blowing from approximately: {compass[nearest]}")
+        wind_direction = st.slider("Wind direction (° FROM)", 0, 359, 0)
+        _compass = {0:"N",45:"NE",90:"E",135:"SE",180:"S",225:"SW",270:"W",315:"NW"}
+        _near = min(_compass, key=lambda k: abs(k - wind_direction))
+        st.caption(f"Wind from approximately: {_compass[_near]}")
 
     st.markdown("---")
     st.markdown("**Simulate a Hypothetical Fire Station**")
-    st.caption("Add a virtual fire station to see how it would reduce access risk in the area.")
     add_station = st.checkbox("Enable hypothetical fire station")
     extra_station = None
     if add_station:
-        s_col1, s_col2 = st.columns(2)
-        with s_col1:
-            s_lat = st.number_input("Station Latitude", value=23.774, min_value=-90.0, max_value=90.0, step=0.001, format="%.5f", key="s_lat")
-        with s_col2:
-            s_lon = st.number_input("Station Longitude", value=90.405, min_value=-180.0, max_value=180.0, step=0.001, format="%.5f", key="s_lon")
+        sc1, sc2 = st.columns(2)
+        with sc1: s_lat = st.number_input("Station Lat", value=23.774, min_value=-90.0,  max_value=90.0,  step=0.001, format="%.5f", key="s_lat")
+        with sc2: s_lon = st.number_input("Station Lon", value=90.405, min_value=-180.0, max_value=180.0, step=0.001, format="%.5f", key="s_lon")
         extra_station = (s_lat, s_lon)
-        st.info(f"Hypothetical station at ({s_lat:.5f}, {s_lon:.5f}) will be included in access risk calculations.")
+        st.info(f"Hypothetical station at ({s_lat:.5f}, {s_lon:.5f}) included in access-risk calculations.")
 
-# --- Cached data fetching (split into steps for progress feedback) ---
-def _get_target_epsg(location_point):
+# ── Parallel cached OSM fetching ──────────────────────────────────────────────
+def _target_epsg(location_point):
     gdf = gpd.GeoDataFrame(geometry=[Point(location_point[1], location_point[0])], crs="EPSG:4326")
     return gdf.estimate_utm_crs().to_epsg()
 
 @st.cache_data(show_spinner=False)
-def fetch_road_network(location_point, distance, road_types_tuple, target_epsg):
-    import osmnx as ox
-    graph = ox.graph_from_point(location_point, dist=distance, network_type='all')
-    graph_proj = ox.project_graph(graph, to_crs=target_epsg)
-    edges = ox.graph_to_gdfs(graph_proj, nodes=False)
-    accessible_roads = edges[edges['highway'].isin(list(road_types_tuple))]
-    return graph_proj, accessible_roads
-
-@st.cache_data(show_spinner=False)
-def fetch_buildings(location_point, distance, target_epsg):
+def fetch_all_osm_parallel(location_point, distance, road_types_tuple, target_epsg):
+    """Fetches road network, buildings, water, fire stations, and hazards all in parallel."""
     import osmnx as ox
     import geopandas as gpd
-    try:
-        buildings = ox.features_from_point(location_point, {"building": True}, dist=distance)
-        return buildings.to_crs(target_epsg)
-    except Exception:
-        return gpd.GeoDataFrame(columns=['geometry'], crs=target_epsg)
+    ox.settings.requests_timeout = 180
 
-@st.cache_data(show_spinner=False)
-def fetch_water_sources(location_point, distance, target_epsg):
-    import osmnx as ox
-    import geopandas as gpd
-    try:
-        water = ox.features_from_point(location_point, {"natural": "water", "amenity": "fire_hydrant"}, dist=distance)
-        return water.to_crs(target_epsg)
-    except Exception:
-        return gpd.GeoDataFrame(columns=['geometry'], crs=target_epsg)
+    def _graph():
+        try:
+            g  = ox.graph_from_point(location_point, dist=distance, network_type='all')
+            gp = ox.project_graph(g, to_crs=target_epsg)
+            edges = ox.graph_to_gdfs(gp, nodes=False)
+            ar = edges[edges['highway'].isin(list(road_types_tuple))]
+            return gp, ar
+        except Exception as e:
+            print(f"Graph error: {e}"); return None, None
 
-@st.cache_data(show_spinner=False)
-def fetch_fire_stations(location_point, distance, target_epsg):
-    import osmnx as ox
-    import geopandas as gpd
-    try:
-        stations = ox.features_from_point(location_point, {"amenity": "fire_station"}, dist=distance)
-        return stations.to_crs(target_epsg)
-    except Exception:
-        return gpd.GeoDataFrame(columns=['geometry'], crs=target_epsg)
+    def _buildings():
+        try:
+            b = ox.features_from_point(location_point, {"building": True}, dist=distance)
+            return b.to_crs(target_epsg)
+        except: return gpd.GeoDataFrame(columns=['geometry'], crs=target_epsg)
 
-# --- Analyze button ---
-if st.button("Analyze Location"):
-    weights = {"density": density_weight / 100, "access": access_weight / 100, "water": water_weight / 100, "height": height_weight / 100}
-    total_weight = sum(weights.values())
-    if total_weight > 0:
-        weights = {k: v / total_weight for k, v in weights.items()}
+    def _water():
+        try:
+            w = ox.features_from_point(location_point,
+                {"natural": "water", "amenity": "fire_hydrant"}, dist=distance)
+            return w.to_crs(target_epsg)
+        except: return gpd.GeoDataFrame(columns=['geometry'], crs=target_epsg)
+
+    def _stations():
+        try:
+            s = ox.features_from_point(location_point, {"amenity": "fire_station"}, dist=distance)
+            return s.to_crs(target_epsg)
+        except: return gpd.GeoDataFrame(columns=['geometry'], crs=target_epsg)
+
+    def _hazards():
+        try:
+            h = ox.features_from_point(location_point,
+                {"amenity": ["fuel", "hospital", "school", "marketplace"]}, dist=distance)
+            return h.to_crs(target_epsg)
+        except: return gpd.GeoDataFrame(columns=['geometry'], crs=target_epsg)
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        fg = ex.submit(_graph)
+        fb = ex.submit(_buildings)
+        fw = ex.submit(_water)
+        fs = ex.submit(_stations)
+        fh = ex.submit(_hazards)
+        graph_proj, accessible_roads = fg.result()
+        buildings    = fb.result()
+        water        = fw.result()
+        stations     = fs.result()
+        hazards      = fh.result()
+
+    return graph_proj, accessible_roads, buildings, water, stations, hazards
+
+# ── Analyse button ────────────────────────────────────────────────────────────
+if st.button("🔍 Analyze Location", type="primary"):
+    weights = {
+        "density": density_weight / 100, "access": access_weight / 100,
+        "water":   water_weight   / 100, "height": height_weight / 100,
+        "hazard":  hazard_weight  / 100,
+    }
+    total_w = sum(weights.values())
+    if total_w > 0:
+        weights = {k: v / total_w for k, v in weights.items()}
     else:
         st.error("Total weight cannot be zero."); st.stop()
 
     if not selected_road_types:
-        st.error("Please select at least one road type in Advanced Options."); st.stop()
+        st.error("Select at least one road type in Advanced Options."); st.stop()
 
     if input_method == 'Search by Name':
         if location_query:
             try:
-                geolocator = Nominatim(user_agent="fire_risk_app", timeout=10)
-                location = geolocator.geocode(location_query)
-                if location:
-                    st.info(f"Found location: {location.address}")
-                    location_point = (location.latitude, location.longitude)
+                geo = Nominatim(user_agent="fire_risk_app", timeout=10).geocode(location_query)
+                if geo:
+                    st.info(f"Found: {geo.address}")
+                    location_point = (geo.latitude, geo.longitude)
                 else:
-                    st.error("Could not find the location."); location_point = None
+                    st.error("Location not found."); location_point = None
             except Exception as e:
                 st.error(f"Geocoding failed: {e}"); location_point = None
         else:
-            st.warning("Please enter a location name."); location_point = None
+            st.warning("Enter a location name."); location_point = None
 
     if location_point:
-        st.info(f"Weights — Density: {weights['density']:.0%} | Access: {weights['access']:.0%} | Water: {weights['water']:.0%} | Height: {weights['height']:.0%}")
-        progress = st.progress(0, text="Starting analysis...")
+        st.info(f"Weights — Density {weights['density']:.0%} | Access {weights['access']:.0%} | Water {weights['water']:.0%} | Height {weights['height']:.0%} | Hazard {weights['hazard']:.0%}")
+        progress = st.progress(0, text="Starting analysis…")
 
         try:
-            progress.progress(5, text="Computing coordinate system...")
-            target_epsg = _get_target_epsg(location_point)
+            progress.progress(5, text="Computing coordinate reference system…")
+            tepsg = _target_epsg(location_point)
 
-            progress.progress(10, text="Step 1/4 — Fetching road network from OSM (this is the slowest step, ~1-3 min on first run)...")
-            graph, accessible_roads = fetch_road_network(
-                location_point, search_dist, tuple(selected_road_types), target_epsg
+            progress.progress(10, text="Fetching all OSM data in parallel (road network + buildings + water + stations + hazards)…")
+            graph, accessible_roads, buildings, water_sources, fire_stations, hazards = fetch_all_osm_parallel(
+                location_point, search_dist, tuple(selected_road_types), tepsg
             )
 
             if graph is None:
-                st.error("Could not download road network. Check your internet connection or try a different location.")
-                progress.empty()
-                st.stop()
-
-            progress.progress(30, text="Step 2/4 — Fetching building footprints...")
-            buildings = fetch_buildings(location_point, search_dist, target_epsg)
-
-            progress.progress(50, text="Step 3/4 — Fetching water sources...")
-            water_sources = fetch_water_sources(location_point, search_dist, target_epsg)
-
-            progress.progress(65, text="Step 4/4 — Fetching fire station locations...")
-            fire_stations = fetch_fire_stations(location_point, search_dist, target_epsg)
-
+                st.error("Could not download road network. Check your internet or try a different location.")
+                progress.empty(); st.stop()
             if buildings.empty:
-                st.error("No buildings found for this location. Try a larger radius.")
-                progress.empty()
-                st.stop()
+                st.error("No buildings found. Try a larger radius.")
+                progress.empty(); st.stop()
 
-            # --- Data quality indicators ---
             n_buildings = len(buildings)
-            n_stations = len(fire_stations) if not fire_stations.empty else 0
-            n_water = len(water_sources) if not water_sources.empty else 0
+            n_stations  = len(fire_stations)  if not fire_stations.empty  else 0
+            n_water     = len(water_sources)   if not water_sources.empty  else 0
+            n_hazards   = len(hazards)         if not hazards.empty        else 0
 
             st.markdown("**Data Quality**")
-            q1, q2, q3 = st.columns(3)
-            with q1:
-                st.metric("Buildings Found", n_buildings)
-            with q2:
-                st.metric("Fire Stations (OSM)", n_stations)
-            with q3:
-                st.metric("Water Sources (OSM)", n_water)
+            dq1, dq2, dq3, dq4 = st.columns(4)
+            with dq1: st.metric("Buildings",     n_buildings)
+            with dq2: st.metric("Fire Stations", n_stations)
+            with dq3: st.metric("Water Sources", n_water)
+            with dq4: st.metric("Hazard Points", n_hazards)
 
             if n_stations == 0 and extra_station is None:
-                st.warning("No fire stations found in OSM data for this area. Access risk defaults to maximum distance (5000m). Consider adding a hypothetical station in Advanced Options.")
-            elif n_stations == 0 and extra_station is not None:
-                st.info("No OSM fire stations found, but your hypothetical station will be used for access risk.")
-            if n_water == 0:
-                st.warning("No water sources found in OSM data for this area. Water proximity risk defaults to maximum distance (1000m).")
+                st.warning("No fire stations found in OSM. Access risk defaults to max distance. Add a hypothetical station in Advanced Options.")
+            if n_water   == 0: st.warning("No water sources found in OSM. Water risk defaults to max distance.")
+            if n_hazards == 0: st.info("No hazard points (gas stations, hospitals, schools) found — hazard weight has no effect.")
 
-            progress.progress(72, text="Calculating building density grid...")
+            progress.progress(65, text="Calculating density grid…")
             density_grid = calculate_density_grid(buildings)
 
-            progress.progress(76, text="Extracting building height data...")
-            buildings_with_heights = calculate_height_risk(buildings)
+            progress.progress(69, text="Extracting building height & occupancy…")
+            bh  = calculate_height_risk(buildings)
+            bho = calculate_occupancy_modifier(bh)
 
-            progress.progress(78, text="Calculating travel distance to fire stations...")
-            buildings_with_travel_risk = calculate_travel_risk(buildings_with_heights, fire_stations, graph, extra_station)
+            progress.progress(72, text="Applying road-width modifier…")
+            density_grid = calculate_road_width_modifier(density_grid, accessible_roads)
 
-            progress.progress(83, text="Calculating water source proximity risk...")
-            buildings_with_all_risks = calculate_water_risk(buildings_with_travel_risk, water_sources)
+            progress.progress(75, text="Calculating travel distance to fire stations…")
+            bt = calculate_travel_risk(bho, fire_stations, graph, extra_station)
 
-            progress.progress(87, text="Computing composite risk scores...")
-            final_risk_grid = calculate_composite_risk(density_grid, buildings_with_all_risks, weights)
+            progress.progress(80, text="Calculating water proximity risk…")
+            bw = calculate_water_risk(bt, water_sources)
+
+            progress.progress(83, text="Calculating hazard proximity risk…")
+            ba = calculate_hazard_risk(bw, hazards)
+
+            progress.progress(86, text="Computing composite risk scores…")
+            final_risk_grid = calculate_composite_risk(density_grid, ba, weights)
             if wind_direction is not None:
                 final_risk_grid = apply_wind_modifier(final_risk_grid, wind_direction)
 
-            progress.progress(90, text="Rendering building footprints map...")
+            progress.progress(90, text="Rendering maps…")
             save_footprints_map(buildings, graph, 'building_footprints.png')
-
-            progress.progress(93, text="Rendering road network map...")
             save_roads_map(accessible_roads, graph, 'road_network.png')
 
-            progress.progress(96, text="Generating static risk heatmap...")
+            progress.progress(94, text="Generating static risk heatmap…")
             generate_static_risk_map(final_risk_grid, graph)
 
-            progress.progress(98, text="Generating interactive map...")
-            generate_interactive_risk_map(final_risk_grid, fire_stations, water_sources, extra_station)
+            progress.progress(97, text="Generating interactive map…")
+            generate_interactive_risk_map(
+                final_risk_grid, fire_stations, water_sources, extra_station, accessible_roads
+            )
 
-            # --- Save to history ---
+            # Save history
             os.makedirs("history", exist_ok=True)
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            safe_name = "".join(c if c.isalnum() else "_" for c in location_query)[:30]
-            history_prefix = f"history/{timestamp}_{safe_name}"
-            final_risk_grid.to_crs("EPSG:4326").to_file(f"{history_prefix}.geojson", driver="GeoJSON")
-            with open(f"{history_prefix}_meta.json", "w") as f:
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            sn = "".join(c if c.isalnum() else "_" for c in location_query)[:30]
+            hp = f"history/{ts}_{sn}"
+            final_risk_grid.to_crs("EPSG:4326").to_file(f"{hp}.geojson", driver="GeoJSON")
+            with open(f"{hp}_meta.json", "w") as mf:
                 json.dump({
-                    "place": location_query,
-                    "timestamp": timestamp,
-                    "radius_m": search_dist,
-                    "weights": {k: round(v, 3) for k, v in weights.items()},
-                    "n_buildings": n_buildings,
-                    "n_stations": n_stations,
-                    "n_water": n_water,
-                    "road_types": selected_road_types,
-                    "hypothetical_station": extra_station,
-                }, f, indent=2)
+                    "place": location_query, "timestamp": ts,
+                    "radius_m": search_dist, "weights": {k: round(v, 3) for k, v in weights.items()},
+                    "n_buildings": n_buildings, "n_stations": n_stations,
+                    "n_water": n_water, "n_hazards": n_hazards,
+                    "avg_risk": round(float(final_risk_grid['final_risk'].mean()), 4),
+                    "max_risk": round(float(final_risk_grid['final_risk'].max()), 4),
+                }, mf, indent=2)
 
             progress.progress(100, text="Analysis complete!")
-            st.success("Analysis complete!")
-            st.session_state.maps_generated = True
-            st.session_state.final_risk_grid = final_risk_grid
-            st.session_state.location_query = location_query
-            # Rolling scenario snapshots for comparison
-            snapshot = {
-                'label': f"{location_query} | r={search_dist}m | D:{weights['density']:.0%} A:{weights['access']:.0%} W:{weights['water']:.0%} H:{weights['height']:.0%}",
+            st.success("✅ Analysis complete!")
+            st.toast("🔥 Fire risk analysis finished!", icon="✅")
+
+            st.session_state.maps_generated      = True
+            st.session_state.final_risk_grid     = final_risk_grid
+            st.session_state.location_query      = location_query
+            st.session_state.last_location_point = location_point
+            st.session_state.last_accessible_roads = accessible_roads
+
+            snap = {
+                'label': f"{location_query} | r={search_dist}m | D:{weights['density']:.0%} A:{weights['access']:.0%} W:{weights['water']:.0%} H:{weights['height']:.0%} Z:{weights['hazard']:.0%}",
                 'grid': final_risk_grid,
             }
             st.session_state.scenario_b = st.session_state.scenario_a
-            st.session_state.scenario_a = snapshot
+            st.session_state.scenario_a = snap
 
         except Exception as e:
-            st.error(f"An error occurred during analysis: {e}")
-            st.exception(e)
-            progress.empty()
+            st.error(f"Analysis error: {e}"); st.exception(e); progress.empty()
 
-# --- Results ---
+# ── Results ───────────────────────────────────────────────────────────────────
 if st.session_state.maps_generated and st.session_state.final_risk_grid is not None:
-    final_risk_grid = st.session_state.final_risk_grid
-    lq = st.session_state.location_query or "location"
+    frg = st.session_state.final_risk_grid
+    lq  = st.session_state.location_query or "location"
+    lpt = st.session_state.last_location_point
+    lar = st.session_state.last_accessible_roads
 
+    # ── Summary stats ─────────────────────────────────────────────────────────
     st.markdown("---")
-    st.subheader("Analysis Summary")
-    band_counts = final_risk_grid['risk_band'].value_counts()
-    total_cells = len(final_risk_grid[final_risk_grid['n_buildings'] > 0])
-    s1, s2, s3, s4, s5, s6 = st.columns(6)
-    with s1:
-        st.metric("Avg Risk Score", f"{final_risk_grid['final_risk'].mean():.3f}")
-    with s2:
-        st.metric("Max Risk Score", f"{final_risk_grid['final_risk'].max():.3f}")
-    with s3:
-        st.metric("Critical Zones", int(band_counts.get('Critical', 0)))
-    with s4:
-        st.metric("High Zones", int(band_counts.get('High', 0)))
-    with s5:
-        st.metric("Medium Zones", int(band_counts.get('Medium', 0)))
-    with s6:
-        st.metric("Low Zones", int(band_counts.get('Low', 0)))
+    st.subheader("📊 Analysis Summary")
+    bc = frg['risk_band'].value_counts()
+    s1,s2,s3,s4,s5,s6 = st.columns(6)
+    with s1: st.metric("Avg Risk",      f"{frg['final_risk'].mean():.3f}")
+    with s2: st.metric("Max Risk",      f"{frg['final_risk'].max():.3f}")
+    with s3: st.metric("⛔ Critical",   int(bc.get('Critical', 0)))
+    with s4: st.metric("🔴 High",       int(bc.get('High',     0)))
+    with s5: st.metric("🟡 Medium",     int(bc.get('Medium',   0)))
+    with s6: st.metric("🟢 Low",        int(bc.get('Low',      0)))
+    top1 = frg.nlargest(1, 'final_risk').to_crs("EPSG:4326")
+    st.caption(f"Highest-risk cell: lat {top1.centroid.y.values[0]:.5f}, lon {top1.centroid.x.values[0]:.5f} — score {frg['final_risk'].max():.4f} ({frg.nlargest(1,'final_risk')['risk_band'].values[0]})")
 
-    top1 = final_risk_grid.nlargest(1, 'final_risk').to_crs("EPSG:4326")
-    top1_lat = top1.centroid.y.values[0]
-    top1_lon = top1.centroid.x.values[0]
-    st.caption(f"Highest-risk cell: lat {top1_lat:.5f}, lon {top1_lon:.5f} — score {final_risk_grid['final_risk'].max():.4f} ({final_risk_grid.nlargest(1,'final_risk')['risk_band'].values[0]})")
-
+    # ── Auto recommendations ──────────────────────────────────────────────────
     st.markdown("---")
-    st.subheader("Analysis Summary Maps")
-    map_col1, map_col2 = st.columns(2)
-    with map_col1:
-        st.image('building_footprints.png', caption='Building Footprints', use_container_width=True)
-    with map_col2:
-        st.image('road_network.png', caption='Accessible Road Network', use_container_width=True)
+    st.subheader("💡 Recommendations")
+    recs = []
+    _avg = frg['final_risk'].mean()
+    _crit = int(bc.get('Critical', 0))
+    _high = int(bc.get('High',     0))
+    _max  = frg['final_risk'].max()
+    if _crit > 0:
+        recs.append(f"⛔ **{_crit} Critical zone(s) detected.** Prioritise fire safety inspections and ensure emergency access routes are clear.")
+    if _high > 0:
+        recs.append(f"🔴 **{_high} High-risk zone(s) found.** Consider deploying additional fire hydrants or temporary water tanks in these areas.")
+    if _avg > 0.5:
+        recs.append("📍 **Overall average risk is high.** This area may benefit from a new fire station or a major infrastructure review.")
+    if _max >= 0.75:
+        c1 = frg.nlargest(1, 'final_risk').to_crs("EPSG:4326")
+        recs.append(f"🗺 **Highest-risk cell at ({c1.centroid.y.values[0]:.4f}, {c1.centroid.x.values[0]:.4f}).** Field verification recommended.")
+    if 'access_risk' in frg.columns and frg['access_risk'].mean() > 0.6:
+        recs.append("🚒 **Fire station access risk is high across the area.** Road network improvements or an additional station would significantly reduce response times.")
+    if 'water_risk' in frg.columns and frg['water_risk'].mean() > 0.6:
+        recs.append("💧 **Water source proximity is low.** Installing more hydrants or ensuring natural water sources are accessible could reduce suppression difficulty.")
+    if not recs:
+        recs.append("✅ Risk profile is within acceptable ranges. Continue routine monitoring.")
+    for r in recs:
+        st.markdown(f"- {r}")
+
+    # ── Maps ──────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🗺 Analysis Summary Maps")
+    mc1, mc2 = st.columns(2)
+    with mc1: st.image('building_footprints.png', caption='Building Footprints',    use_container_width=True)
+    with mc2: st.image('road_network.png',        caption='Accessible Road Network', use_container_width=True)
     st.image('final_risk_map.png', caption='Static Composite Risk Heatmap', use_container_width=True)
 
+    # ── Interactive map ───────────────────────────────────────────────────────
     st.markdown("---")
-    st.subheader("Interactive Fire Risk Map")
-    st.caption("Click anywhere on the map to capture coordinates for a hypothetical fire station.")
-    try:
-        import folium
-        from streamlit_folium import st_folium as _st_folium
-        with open('interactive_risk_map.html', 'r', encoding='utf-8') as f:
-            _map_html = f.read()
-        # Rebuild a minimal folium map for click interaction
-        _grid_wgs84 = final_risk_grid.to_crs("EPSG:4326")
-        _center = [_grid_wgs84.centroid.y.mean(), _grid_wgs84.centroid.x.mean()]
-        _click_map = folium.Map(location=_center, zoom_start=15, tiles="CartoDB positron")
-        components.html(_map_html, height=550, scrolling=True)
+    st.subheader("🌍 Interactive Fire Risk Map")
+    st.caption("Layers: Risk Grid · Risk Heatmap · Road Risk Overlay · Fire Stations · Water Sources · Distance Rings · Satellite. Click map below to capture coordinates.")
 
-        st.markdown("**Click-to-place station (use map above to find coordinates, enter below):**")
-        st.caption("Or use the coordinate capture map:")
-        _capture_map = folium.Map(location=_center, zoom_start=15, tiles="CartoDB positron")
-        folium.Marker(_center, tooltip="Area center").add_to(_capture_map)
-        _map_data = _st_folium(_capture_map, height=300, width="100%", returned_objects=["last_clicked"])
-        if _map_data and _map_data.get("last_clicked"):
-            _clicked = _map_data["last_clicked"]
-            st.success(f"Clicked: lat={_clicked['lat']:.5f}, lon={_clicked['lng']:.5f}")
-            st.caption("Copy these into the Hypothetical Fire Station fields in Advanced Options, then re-run the analysis.")
-    except FileNotFoundError:
-        st.error("Interactive map file not found. Please run the analysis again.")
-    except Exception as _e:
-        st.error(f"Map error: {_e}")
-
-    st.markdown("---")
-    st.subheader("Top Risk Hotspots")
-    st.caption("Risk bands: 🟢 Low (0–0.25)  🟡 Medium (0.25–0.50)  🔴 High (0.50–0.75)  ⛔ Critical (0.75–1.0)")
-    top_n = st.slider("Number of hotspots to display", min_value=5, max_value=30, value=10)
-    hotspots = final_risk_grid.nlargest(top_n, 'final_risk').to_crs("EPSG:4326").copy()
-    hotspots['Latitude'] = hotspots.centroid.y.round(5)
-    hotspots['Longitude'] = hotspots.centroid.x.round(5)
-    hotspots['Risk Score'] = hotspots['final_risk'].round(4)
-    hotspots['Band'] = hotspots['risk_band']
-    hotspots['Buildings in Cell'] = hotspots['n_buildings'].astype(int)
-    hotspots['Density Risk'] = hotspots['density_risk'].round(3)
-    hotspots['Access Risk'] = hotspots['access_risk'].round(3)
-    hotspots['Water Risk'] = hotspots['water_risk'].round(3)
-    st.dataframe(
-        hotspots[['Latitude', 'Longitude', 'Risk Score', 'Band', 'Buildings in Cell', 'Density Risk', 'Access Risk', 'Water Risk']].reset_index(drop=True),
-        use_container_width=True
-    )
-
-    st.markdown("---")
-    st.subheader("Export & Share")
-    st.caption("Click a button below to download the risk data for use in GIS tools like QGIS or ArcGIS.")
-    if input_method == 'Enter Coordinates' and location_point:
-        share_url = f"?method=Enter+Coordinates&lat={location_point[0]}&lon={location_point[1]}&r={search_dist}"
-    else:
-        share_url = f"?method=Search+by+Name&loc={lq.replace(' ', '+')}&r={search_dist}"
-    st.code(f"http://localhost:8501/{share_url}", language=None)
-    st.caption("Copy the link above to share this exact analysis setup with someone else.")
-    dl_col1, dl_col2 = st.columns(2)
-
-    with dl_col1:
-        geojson_data = final_risk_grid.to_crs("EPSG:4326").to_json()
-        st.download_button(
-            label="Download Risk Grid (GeoJSON)",
-            data=geojson_data,
-            file_name=f"risk_grid_{lq.replace(' ', '_').replace(',', '')}.geojson",
-            mime="application/geo+json",
-        )
-
-    with dl_col2:
-        grid_wgs84 = final_risk_grid.to_crs("EPSG:4326").copy()
-        grid_wgs84['lat'] = grid_wgs84.centroid.y
-        grid_wgs84['lon'] = grid_wgs84.centroid.x
-        csv_data = grid_wgs84[['lat', 'lon', 'n_buildings', 'density_risk', 'access_risk', 'water_risk', 'final_risk', 'risk_band']].to_csv(index=False)
-        st.download_button(
-            label="Download Risk Data (CSV)",
-            data=csv_data,
-            file_name=f"risk_data_{lq.replace(' ', '_').replace(',', '')}.csv",
-            mime="text/csv",
-        )
-
-    # --- HTML report ---
     try:
         with open('interactive_risk_map.html', 'r', encoding='utf-8') as _f:
-            _map_embed = _f.read()
-        _top5 = final_risk_grid.nlargest(5, 'final_risk').to_crs("EPSG:4326").copy()
-        _top5['lat'] = _top5.centroid.y.round(5)
-        _top5['lon'] = _top5.centroid.x.round(5)
+            _mhtml = _f.read()
+        components.html(_mhtml, height=550, scrolling=True)
+
+        # Fullscreen button
+        if os.path.exists('interactive_risk_map.html'):
+            with open('interactive_risk_map.html', 'rb') as _ff:
+                st.download_button("🔲 Download Map for Fullscreen View", data=_ff.read(),
+                                   file_name="fire_risk_interactive_map.html", mime="text/html")
+
+        # Click-to-place capture map
+        import folium as _fl
+        _gw = frg.to_crs("EPSG:4326")
+        _ctr = [_gw.centroid.y.mean(), _gw.centroid.x.mean()]
+        _cm = _fl.Map(location=_ctr, zoom_start=15, tiles="CartoDB positron")
+        _fl.Marker(_ctr, tooltip="Area centre").add_to(_cm)
+        st.caption("📍 Click on the map below to get coordinates for a hypothetical fire station:")
+        _md = _st_folium(_cm, height=280, width="100%", returned_objects=["last_clicked"])
+        if _md and _md.get("last_clicked"):
+            _cl = _md["last_clicked"]
+            st.success(f"Clicked: lat={_cl['lat']:.5f}, lon={_cl['lng']:.5f} — copy into Advanced Options → Hypothetical Station")
+    except FileNotFoundError:
+        st.error("Interactive map not found. Run analysis first.")
+    except Exception as _me:
+        st.error(f"Map error: {_me}")
+
+    # ── Hotspot table ─────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🔥 Top Risk Hotspots")
+    st.caption("Risk bands: 🟢 Low (0–0.25) · 🟡 Medium (0.25–0.50) · 🔴 High (0.50–0.75) · ⛔ Critical (0.75–1.0)")
+    top_n = st.slider("Hotspots to display", 5, 30, 10)
+    hs = frg.nlargest(top_n, 'final_risk').to_crs("EPSG:4326").copy()
+    hs['Latitude']        = hs.centroid.y.round(5)
+    hs['Longitude']       = hs.centroid.x.round(5)
+    hs['Risk Score']      = hs['final_risk'].round(4)
+    hs['Band']            = hs['risk_band']
+    hs['Buildings']       = hs['n_buildings'].astype(int)
+    hs['Density Risk']    = hs['density_risk'].round(3)
+    hs['Access Risk']     = hs['access_risk'].round(3)
+    hs['Water Risk']      = hs['water_risk'].round(3)
+    _hcols = ['Latitude','Longitude','Risk Score','Band','Buildings','Density Risk','Access Risk','Water Risk']
+    if 'hazard_risk' in hs.columns:
+        hs['Hazard Risk'] = hs['hazard_risk'].round(3)
+        _hcols.append('Hazard Risk')
+    st.dataframe(hs[_hcols].reset_index(drop=True), use_container_width=True)
+
+    # ── Export & Share ────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📥 Export & Share")
+    _lqsafe = lq.replace(' ','_').replace(',','')
+
+    # Shareable URL
+    if input_method == 'Enter Coordinates' and lpt:
+        _url = f"?method=Enter+Coordinates&lat={lpt[0]}&lon={lpt[1]}&r={search_dist}"
+    else:
+        _url = f"?method=Search+by+Name&loc={lq.replace(' ','+')}&r={search_dist}"
+    st.code(f"http://localhost:8501/{_url}", language=None)
+    st.caption("Copy the link above to share this analysis setup.")
+
+    ex1, ex2, ex3, ex4 = st.columns(4)
+
+    # GeoJSON
+    with ex1:
+        st.download_button("📦 GeoJSON", data=frg.to_crs("EPSG:4326").to_json(),
+                           file_name=f"risk_grid_{_lqsafe}.geojson", mime="application/geo+json")
+
+    # CSV
+    with ex2:
+        _gw2 = frg.to_crs("EPSG:4326").copy()
+        _gw2['lat'] = _gw2.centroid.y; _gw2['lon'] = _gw2.centroid.x
+        _ccols = ['lat','lon','n_buildings','density_risk','access_risk','water_risk','final_risk','risk_band']
+        if 'hazard_risk' in _gw2.columns: _ccols.append('hazard_risk')
+        st.download_button("📊 CSV", data=_gw2[_ccols].to_csv(index=False),
+                           file_name=f"risk_data_{_lqsafe}.csv", mime="text/csv")
+
+    # Shapefile (zipped)
+    with ex3:
+        try:
+            _shp_buf = io.BytesIO()
+            with zipfile.ZipFile(_shp_buf, 'w', zipfile.ZIP_DEFLATED) as _zf:
+                import tempfile, shutil
+                _td = tempfile.mkdtemp()
+                _sp = os.path.join(_td, "risk_grid")
+                frg.to_crs("EPSG:4326").to_file(_sp + ".shp")
+                for _ext in ['.shp','.shx','.dbf','.prj','.cpg']:
+                    _fp = _sp + _ext
+                    if os.path.exists(_fp):
+                        _zf.write(_fp, f"risk_grid{_ext}")
+                shutil.rmtree(_td)
+            st.download_button("🗂 Shapefile (.zip)", data=_shp_buf.getvalue(),
+                               file_name=f"risk_shapefile_{_lqsafe}.zip", mime="application/zip")
+        except Exception as _se:
+            st.caption(f"Shapefile: {_se}")
+
+    # KMZ
+    with ex4:
+        try:
+            import simplekml
+            _kml = simplekml.Kml()
+            _gkml = frg.to_crs("EPSG:4326")
+            for _, _row in _gkml.iterrows():
+                _pt = _row.geometry.centroid
+                _pk = _kml.newpoint(name=f"Risk {_row['final_risk']:.3f}",
+                                    coords=[(_pt.x, _pt.y)])
+                _pk.description = f"Band: {_row['risk_band']} | Buildings: {int(_row['n_buildings'])}"
+            _kmz_buf = io.BytesIO()
+            with zipfile.ZipFile(_kmz_buf, 'w') as _zf:
+                _zf.writestr("doc.kml", _kml.kml())
+            st.download_button("🌐 KMZ (Google Earth)", data=_kmz_buf.getvalue(),
+                               file_name=f"risk_map_{_lqsafe}.kmz", mime="application/vnd.google-earth.kmz")
+        except ImportError:
+            st.caption("KMZ: install simplekml (`pip install simplekml`)")
+        except Exception as _ke:
+            st.caption(f"KMZ: {_ke}")
+
+    # HTML report
+    try:
+        with open('interactive_risk_map.html', 'r', encoding='utf-8') as _rf:
+            _me = _rf.read()
+        _t5 = frg.nlargest(5,'final_risk').to_crs("EPSG:4326").copy()
+        _t5['lat'] = _t5.centroid.y.round(5); _t5['lon'] = _t5.centroid.x.round(5)
         _rows = "".join(
             f"<tr><td>{i+1}</td><td>{r['lat']}</td><td>{r['lon']}</td>"
             f"<td>{r['final_risk']:.4f}</td><td>{r['risk_band']}</td><td>{int(r['n_buildings'])}</td></tr>"
-            for i, (_, r) in enumerate(_top5.iterrows())
-        )
-        _bc = final_risk_grid['risk_band'].value_counts()
-        _html_report = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
-<title>Fire Risk Report – {lq}</title>
-<style>
-  body{{font-family:Arial,sans-serif;max-width:1100px;margin:auto;padding:20px;background:#111;color:#eee}}
-  h1{{color:#ff4444}} h2{{color:#ffaa00;margin-top:30px}}
-  table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #444;padding:8px;text-align:center}}
-  th{{background:#222}} .stat{{display:inline-block;background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:12px 20px;margin:6px;min-width:120px;text-align:center}}
-  .stat .val{{font-size:1.6em;font-weight:bold;color:#ff4444}} .stat .lbl{{font-size:0.8em;color:#aaa}}
-  iframe{{width:100%;height:500px;border:none;margin-top:10px}}
-</style></head><body>
-<h1>Fire Risk Analysis Report</h1>
+            for i,(_, r) in enumerate(_t5.iterrows()))
+        _hbc = frg['risk_band'].value_counts()
+        _recs_html = "".join(f"<li>{r}</li>" for r in recs) if 'recs' in dir() else ""
+        _html_rep = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Fire Risk Report – {lq}</title><style>
+body{{font-family:Arial,sans-serif;max-width:1200px;margin:auto;padding:20px;background:#111;color:#eee}}
+h1{{color:#ff4444}}h2{{color:#ffaa00;margin-top:30px}}
+table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #444;padding:8px;text-align:center}}
+th{{background:#222}}.stat{{display:inline-block;background:#1e1e1e;border:1px solid #333;
+border-radius:8px;padding:12px 20px;margin:6px;min-width:110px;text-align:center}}
+.stat .val{{font-size:1.6em;font-weight:bold;color:#ff4444}}.stat .lbl{{font-size:.8em;color:#aaa}}
+ul{{line-height:2}}iframe{{width:100%;height:520px;border:none;margin-top:10px}}</style></head><body>
+<h1>🔥 Fire Risk Analysis Report</h1>
 <p><b>Location:</b> {lq} &nbsp;|&nbsp; <b>Generated:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
 <h2>Summary</h2>
-<div class='stat'><div class='val'>{final_risk_grid['final_risk'].mean():.3f}</div><div class='lbl'>Avg Risk</div></div>
-<div class='stat'><div class='val'>{final_risk_grid['final_risk'].max():.3f}</div><div class='lbl'>Max Risk</div></div>
-<div class='stat'><div class='val'>{int(_bc.get('Critical',0))}</div><div class='lbl'>Critical Zones</div></div>
-<div class='stat'><div class='val'>{int(_bc.get('High',0))}</div><div class='lbl'>High Zones</div></div>
-<div class='stat'><div class='val'>{int(_bc.get('Medium',0))}</div><div class='lbl'>Medium Zones</div></div>
-<div class='stat'><div class='val'>{int(_bc.get('Low',0))}</div><div class='lbl'>Low Zones</div></div>
+<div class='stat'><div class='val'>{frg['final_risk'].mean():.3f}</div><div class='lbl'>Avg Risk</div></div>
+<div class='stat'><div class='val'>{frg['final_risk'].max():.3f}</div><div class='lbl'>Max Risk</div></div>
+<div class='stat'><div class='val'>{int(_hbc.get('Critical',0))}</div><div class='lbl'>⛔ Critical</div></div>
+<div class='stat'><div class='val'>{int(_hbc.get('High',0))}</div><div class='lbl'>🔴 High</div></div>
+<div class='stat'><div class='val'>{int(_hbc.get('Medium',0))}</div><div class='lbl'>🟡 Medium</div></div>
+<div class='stat'><div class='val'>{int(_hbc.get('Low',0))}</div><div class='lbl'>🟢 Low</div></div>
+<h2>Recommendations</h2><ul>{_recs_html}</ul>
 <h2>Top 5 Highest-Risk Zones</h2>
 <table><tr><th>#</th><th>Latitude</th><th>Longitude</th><th>Risk Score</th><th>Band</th><th>Buildings</th></tr>
 {_rows}</table>
-<h2>Interactive Risk Map</h2>
-{_map_embed}
-</body></html>"""
-        st.download_button(
-            label="Download Self-Contained HTML Report",
-            data=_html_report,
-            file_name=f"fire_risk_report_{lq.replace(' ','_').replace(',','')}.html",
-            mime="text/html",
-        )
-    except Exception:
-        pass
+<h2>Interactive Risk Map</h2>{_me}</body></html>"""
+        st.download_button("📄 HTML Report (self-contained)", data=_html_rep,
+                           file_name=f"fire_risk_report_{_lqsafe}.html", mime="text/html")
+    except Exception: pass
 
-# --- Scenario Comparison ---
-if st.session_state.scenario_a is not None and st.session_state.scenario_b is not None:
+# ── Scenario Comparison ───────────────────────────────────────────────────────
+if st.session_state.scenario_a and st.session_state.scenario_b:
     st.markdown("---")
-    st.subheader("Scenario Comparison")
-    st.caption("Comparing your last two analyses. Run a new analysis to update Scenario B.")
-    sc_col1, sc_col2 = st.columns(2)
+    st.subheader("⚖ Scenario Comparison")
+    st.caption("Your last two analyses side by side. Run another analysis to refresh.")
 
-    def _scenario_summary(sc):
-        g = sc['grid']
-        bc = g['risk_band'].value_counts()
-        return {
-            "Avg Risk": f"{g['final_risk'].mean():.4f}",
-            "Max Risk": f"{g['final_risk'].max():.4f}",
-            "Critical": int(bc.get('Critical', 0)),
-            "High": int(bc.get('High', 0)),
-            "Medium": int(bc.get('Medium', 0)),
-            "Low": int(bc.get('Low', 0)),
-        }
+    def _sc_sum(sc):
+        g = sc['grid']; b = g['risk_band'].value_counts()
+        return {"Avg Risk": f"{g['final_risk'].mean():.4f}", "Max Risk": f"{g['final_risk'].max():.4f}",
+                "Critical": int(b.get('Critical',0)), "High": int(b.get('High',0)),
+                "Medium": int(b.get('Medium',0)),    "Low":  int(b.get('Low',0))}
 
-    with sc_col1:
+    c1, c2 = st.columns(2)
+    with c1:
         st.markdown(f"**Scenario A (latest):** `{st.session_state.scenario_a['label']}`")
-        st.table(_scenario_summary(st.session_state.scenario_a))
-    with sc_col2:
+        st.table(_sc_sum(st.session_state.scenario_a))
+    with c2:
         st.markdown(f"**Scenario B (previous):** `{st.session_state.scenario_b['label']}`")
-        st.table(_scenario_summary(st.session_state.scenario_b))
+        st.table(_sc_sum(st.session_state.scenario_b))
 
-# --- Previous Analyses ---
+# ── Batch Analysis ────────────────────────────────────────────────────────────
 st.markdown("---")
-st.subheader("Previous Analyses")
-
-history_dir = "history"
-if not os.path.exists(history_dir):
-    st.info("No previous analyses yet. Run an analysis to start building history.")
-else:
-    meta_files = sorted(
-        [f for f in os.listdir(history_dir) if f.endswith("_meta.json")],
-        reverse=True
-    )
-
-    if not meta_files:
-        st.info("No previous analyses yet. Run an analysis to start building history.")
+st.subheader("📋 Batch Analysis")
+st.caption("Analyse multiple locations at once. Enter one place name per line. Results are summary stats only (no maps).")
+_batch_input = st.text_area("Locations (one per line):", placeholder="Korail, Dhaka\nMirpur, Dhaka\nMohakhali, Dhaka", height=120)
+if st.button("Run Batch Analysis"):
+    _locations = [l.strip() for l in _batch_input.strip().split('\n') if l.strip()]
+    if not _locations:
+        st.warning("Enter at least one location.")
     else:
-        history_rows = []
-        for mf in meta_files[:20]:
+        _batch_results = []
+        _bp = st.progress(0, text="Running batch analysis…")
+        _geo = Nominatim(user_agent="fire_risk_batch", timeout=10)
+        for _i, _loc in enumerate(_locations):
             try:
-                with open(os.path.join(history_dir, mf)) as f:
-                    meta = json.load(f)
-                meta['_file'] = mf.replace("_meta.json", "")
-                history_rows.append(meta)
-            except Exception:
-                continue
+                _bp.progress(int((_i / len(_locations)) * 100), text=f"Analysing {_loc}…")
+                _gl = _geo.geocode(_loc)
+                if not _gl:
+                    _batch_results.append({"Location": _loc, "Status": "Not found"}); continue
+                _lpt = (_gl.latitude, _gl.longitude)
+                _bw = {"density":0.33,"access":0.33,"water":0.34,"height":0.0,"hazard":0.0}
+                _tepsg = _target_epsg(_lpt)
+                _bg, _bar, _bb, _bws, _bfs, _bh = fetch_all_osm_parallel(
+                    _lpt, 1000, tuple(DEFAULT_ROAD_TYPES), _tepsg)
+                if _bg is None or _bb.empty:
+                    _batch_results.append({"Location": _loc, "Status": "No data"}); continue
+                _bdg  = calculate_density_grid(_bb)
+                _bbh  = calculate_occupancy_modifier(calculate_height_risk(_bb))
+                _bdg  = calculate_road_width_modifier(_bdg, _bar)
+                _bbt  = calculate_travel_risk(_bbh, _bfs, _bg)
+                _bbw  = calculate_water_risk(_bbt, _bws)
+                _bba  = calculate_hazard_risk(_bbw, _bh)
+                _bfrg = calculate_composite_risk(_bdg, _bba, _bw)
+                _bbc  = _bfrg['risk_band'].value_counts()
+                _batch_results.append({
+                    "Location": _loc, "Buildings": len(_bb),
+                    "Avg Risk": round(float(_bfrg['final_risk'].mean()), 3),
+                    "Max Risk": round(float(_bfrg['final_risk'].max()),  3),
+                    "Critical": int(_bbc.get('Critical', 0)),
+                    "High":     int(_bbc.get('High',     0)),
+                    "Status": "✅ OK",
+                })
+            except Exception as _be:
+                _batch_results.append({"Location": _loc, "Status": f"Error: {_be}"})
+        _bp.progress(100, text="Batch complete!")
+        _bdf = pd.DataFrame(_batch_results)
+        st.dataframe(_bdf, use_container_width=True)
+        st.download_button("Download Batch Results (CSV)", data=_bdf.to_csv(index=False),
+                           file_name="batch_results.csv", mime="text/csv")
 
-        display_df = pd.DataFrame([{
-            "Location": r.get("place", ""),
-            "Date/Time": datetime.datetime.strptime(r["timestamp"], "%Y%m%d_%H%M%S").strftime("%Y-%m-%d %H:%M"),
-            "Radius (m)": r.get("radius_m", ""),
-            "Buildings": r.get("n_buildings", ""),
-            "Fire Stations": r.get("n_stations", ""),
-            "Water Sources": r.get("n_water", ""),
-        } for r in history_rows])
+# ── Previous Analyses + History Chart ────────────────────────────────────────
+st.markdown("---")
+st.subheader("📂 Previous Analyses")
+_hdir = "history"
+if not os.path.exists(_hdir):
+    st.info("No previous analyses yet.")
+else:
+    _mfs = sorted([f for f in os.listdir(_hdir) if f.endswith("_meta.json")], reverse=True)
+    if not _mfs:
+        st.info("No previous analyses yet.")
+    else:
+        _hrs = []
+        for _mf in _mfs[:20]:
+            try:
+                with open(os.path.join(_hdir, _mf)) as _f: _m = json.load(_f)
+                _m['_file'] = _mf.replace("_meta.json",""); _hrs.append(_m)
+            except: continue
 
-        st.dataframe(display_df, use_container_width=True)
+        _hdf = pd.DataFrame([{
+            "Location":     r.get("place",""),
+            "Date/Time":    datetime.datetime.strptime(r["timestamp"],"%Y%m%d_%H%M%S").strftime("%Y-%m-%d %H:%M"),
+            "Radius (m)":   r.get("radius_m",""),
+            "Buildings":    r.get("n_buildings",""),
+            "Fire Stations":r.get("n_stations",""),
+            "Avg Risk":     r.get("avg_risk","—"),
+            "Max Risk":     r.get("max_risk","—"),
+        } for r in _hrs])
+        st.dataframe(_hdf, use_container_width=True)
 
-        selected_label = st.selectbox(
-            "Select a previous run to download:",
-            options=range(len(history_rows)),
-            format_func=lambda i: f"{history_rows[i].get('place','')} — {datetime.datetime.strptime(history_rows[i]['timestamp'], '%Y%m%d_%H%M%S').strftime('%Y-%m-%d %H:%M')}",
-        )
+        # History chart
+        _chart_rows = [r for r in _hrs if r.get("avg_risk") is not None and r.get("max_risk") is not None]
+        if len(_chart_rows) >= 2:
+            import matplotlib.pyplot as _mplt
+            _fig, _ax = _mplt.subplots(figsize=(10, 3))
+            _fig.patch.set_facecolor('#0e1117'); _ax.set_facecolor('#0e1117')
+            _dates  = [datetime.datetime.strptime(r["timestamp"],"%Y%m%d_%H%M%S") for r in _chart_rows]
+            _avgs   = [r["avg_risk"] for r in _chart_rows]
+            _maxs   = [r["max_risk"] for r in _chart_rows]
+            _ax.plot(_dates, _avgs, 'o-', color='#ff9900', label='Avg Risk', linewidth=2)
+            _ax.plot(_dates, _maxs, 's--', color='#ff4444', label='Max Risk', linewidth=2)
+            _ax.set_ylabel("Risk Score", color='white'); _ax.tick_params(colors='white')
+            _ax.spines[:].set_color('#444'); _ax.legend(facecolor='#1e1e1e', labelcolor='white')
+            _ax.set_title("Risk Score Trend Across Analyses", color='white')
+            _mplt.xticks(rotation=30, color='white')
+            st.pyplot(_fig, use_container_width=True)
+            _mplt.close(_fig)
 
-        geojson_path = os.path.join(history_dir, f"{history_rows[selected_label]['_file']}.geojson")
-        if os.path.exists(geojson_path):
-            with open(geojson_path, "r") as f:
-                past_geojson = f.read()
-            st.download_button(
-                label="Download Selected Run (GeoJSON)",
-                data=past_geojson,
-                file_name=f"{history_rows[selected_label]['_file']}.geojson",
-                mime="application/geo+json",
-            )
-        else:
-            st.warning("GeoJSON file for the selected run was not found.")
+        # Download previous run
+        _sel = st.selectbox("Download a previous run:",
+            options=range(len(_hrs)),
+            format_func=lambda i: f"{_hrs[i].get('place','')} — {datetime.datetime.strptime(_hrs[i]['timestamp'],'%Y%m%d_%H%M%S').strftime('%Y-%m-%d %H:%M')}")
+        _gp = os.path.join(_hdir, f"{_hrs[_sel]['_file']}.geojson")
+        if os.path.exists(_gp):
+            with open(_gp) as _gf: _gc = _gf.read()
+            st.download_button("Download Selected Run (GeoJSON)", data=_gc,
+                               file_name=f"{_hrs[_sel]['_file']}.geojson", mime="application/geo+json")
 
 st.markdown("---")
 st.caption("Created by Avishek Adhikari | avishek.jidpus@gmail.com")
