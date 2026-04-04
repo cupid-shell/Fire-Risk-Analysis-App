@@ -128,6 +128,42 @@ def calculate_water_risk(buildings_proj, water_sources_proj):
     print("Water risk calculation complete!")
     return buildings_with_risk
 
+def apply_wind_modifier(risk_grid, wind_direction_deg):
+    """
+    Applies a directional wind multiplier to final_risk.
+    Cells downwind of the area centroid get up to +20% risk boost.
+    wind_direction_deg: compass bearing the wind is blowing FROM (0=N, 90=E, 180=S, 270=W).
+    """
+    import math
+    if wind_direction_deg is None:
+        return risk_grid
+    grid = risk_grid.copy()
+    cx = grid.centroid.x.mean()
+    cy = grid.centroid.y.mean()
+    # Direction wind blows TOWARD (opposite of FROM)
+    wind_rad = math.radians((wind_direction_deg + 180) % 360)
+    dx = math.sin(wind_rad)
+    dy = math.cos(wind_rad)
+    # Dot product of (cell - centroid) with wind vector gives downwind score
+    grid['_cx'] = grid.centroid.x - cx
+    grid['_cy'] = grid.centroid.y - cy
+    dot = grid['_cx'] * dx + grid['_cy'] * dy
+    max_dot = dot.abs().max()
+    if max_dot > 0:
+        wind_factor = (dot / max_dot).clip(0, 1) * 0.20  # up to +20%
+        grid['final_risk'] = (grid['final_risk'] + wind_factor * grid['final_risk']).clip(0, 1)
+    grid = grid.drop(columns=['_cx', '_cy'])
+    return grid
+
+def calculate_height_risk(buildings_proj):
+    """Extracts building:levels from OSM tags and returns per-building height risk."""
+    b = buildings_proj.copy()
+    if 'building:levels' in b.columns:
+        b['levels'] = pd.to_numeric(b['building:levels'], errors='coerce').fillna(1)
+    else:
+        b['levels'] = 1
+    return b
+
 def calculate_composite_risk(density_grid, buildings_with_all_risks, weights):
     print("Calculating composite risk score...")
     grid = density_grid.reset_index(drop=True)
@@ -138,7 +174,10 @@ def calculate_composite_risk(density_grid, buildings_with_all_risks, weights):
         buildings_centroids = buildings_with_all_risks.copy()
         buildings_centroids['geometry'] = buildings_centroids.geometry.centroid
         merged = gpd.sjoin(buildings_centroids, grid, how='left', predicate='within')
-        avg_risks_in_grid = merged.groupby('index_right')[['travel_distance', 'distance_to_water']].mean()
+        agg_cols = ['travel_distance', 'distance_to_water']
+        if 'levels' in buildings_centroids.columns:
+            agg_cols.append('levels')
+        avg_risks_in_grid = merged.groupby('index_right')[agg_cols].mean()
         grid = grid.join(avg_risks_in_grid)
     grid = grid.rename(columns={'travel_distance': 'avg_travel_distance', 'distance_to_water': 'avg_distance_water'})
     grid['avg_travel_distance'] = grid['avg_travel_distance'].fillna(0)
@@ -152,7 +191,30 @@ def calculate_composite_risk(density_grid, buildings_with_all_risks, weights):
     if not grid.empty and (grid['avg_distance_water'].max() - grid['avg_distance_water'].min()) > 0:
         grid['water_risk'] = (grid['avg_distance_water'] - grid['avg_distance_water'].min()) / (grid['avg_distance_water'].max() - grid['avg_distance_water'].min())
     else: grid['water_risk'] = 0
-    grid['final_risk'] = (grid['density_risk'] * weights['density']) + (grid['access_risk'] * weights['access']) + (grid['water_risk'] * weights['water'])
+
+    if 'levels' in grid.columns and weights.get('height', 0) > 0:
+        grid['levels'] = grid['levels'].fillna(1)
+        if (grid['levels'].max() - grid['levels'].min()) > 0:
+            grid['height_risk'] = (grid['levels'] - grid['levels'].min()) / (grid['levels'].max() - grid['levels'].min())
+        else:
+            grid['height_risk'] = 0
+    else:
+        grid['height_risk'] = 0
+
+    grid['final_risk'] = (
+        grid['density_risk'] * weights.get('density', 0) +
+        grid['access_risk']  * weights.get('access', 0) +
+        grid['water_risk']   * weights.get('water', 0) +
+        grid['height_risk']  * weights.get('height', 0)
+    )
+
+    def classify_risk(score):
+        if score >= 0.75:   return 'Critical'
+        elif score >= 0.50: return 'High'
+        elif score >= 0.25: return 'Medium'
+        else:               return 'Low'
+
+    grid['risk_band'] = grid['final_risk'].apply(classify_risk)
     return grid
 
 def save_footprints_map(buildings, graph, filepath):
@@ -201,19 +263,92 @@ def generate_static_risk_map(grid, graph):
     fig.savefig('final_risk_map.png', dpi=300, bbox_inches='tight', pad_inches=0, facecolor='#060606')
     plt.close(fig)
 
-def generate_interactive_risk_map(grid):
+def generate_interactive_risk_map(grid, fire_stations_proj=None, water_sources_proj=None, extra_station=None):
     print("Generating interactive risk map...")
     grid_wgs84 = grid.to_crs("EPSG:4326")
     map_center = [grid_wgs84.centroid.y.mean(), grid_wgs84.centroid.x.mean()]
     m = folium.Map(location=map_center, zoom_start=15, tiles="CartoDB positron")
+
     colormap = cm.LinearColormap(colors=['green', 'yellow', 'red'], vmin=grid['final_risk'].min(), vmax=grid['final_risk'].max())
     colormap.caption = 'Composite Fire Risk Score'
+    tooltip_fields = ['n_buildings', 'final_risk', 'risk_band'] if 'risk_band' in grid_wgs84.columns else ['n_buildings', 'final_risk']
+    tooltip_aliases = ['Buildings:', 'Risk Score:', 'Risk Band:'] if 'risk_band' in grid_wgs84.columns else ['Buildings:', 'Risk Score:']
     style_function = lambda x: {'fillColor': colormap(x['properties']['final_risk']), 'color': 'black', 'weight': 0.5, 'fillOpacity': 0.7}
-    folium.GeoJson(grid_wgs84, style_function=style_function, tooltip=folium.features.GeoJsonTooltip(fields=['n_buildings', 'final_risk'], aliases=['Buildings:', 'Risk Score:'])).add_to(m)
-    m.add_child(colormap); folium.LayerControl().add_to(m)
+    risk_layer = folium.FeatureGroup(name="Risk Grid")
+    folium.GeoJson(grid_wgs84, style_function=style_function, tooltip=folium.features.GeoJsonTooltip(fields=tooltip_fields, aliases=tooltip_aliases)).add_to(risk_layer)
+    risk_layer.add_to(m)
+
+    # Water source markers
+    if water_sources_proj is not None and not water_sources_proj.empty:
+        water_layer = folium.FeatureGroup(name="Water Sources")
+        water_wgs84 = water_sources_proj.to_crs("EPSG:4326")
+        for _, row in water_wgs84.iterrows():
+            pt = row.geometry.centroid
+            folium.CircleMarker(
+                location=[pt.y, pt.x],
+                radius=5,
+                color='blue',
+                fill=True,
+                fill_color='#3399ff',
+                fill_opacity=0.8,
+                tooltip="Water Source"
+            ).add_to(water_layer)
+        water_layer.add_to(m)
+
+    # Fire station markers
+    if fire_stations_proj is not None and not fire_stations_proj.empty:
+        station_layer = folium.FeatureGroup(name="Fire Stations (OSM)")
+        stations_wgs84 = fire_stations_proj.to_crs("EPSG:4326")
+        for _, row in stations_wgs84.iterrows():
+            pt = row.geometry.centroid
+            folium.Marker(
+                location=[pt.y, pt.x],
+                icon=folium.Icon(color='red', icon='fire', prefix='fa'),
+                tooltip="Fire Station"
+            ).add_to(station_layer)
+        station_layer.add_to(m)
+
+    # Hypothetical station marker
+    if extra_station is not None:
+        hyp_layer = folium.FeatureGroup(name="Hypothetical Station")
+        folium.Marker(
+            location=[extra_station[0], extra_station[1]],
+            icon=folium.Icon(color='orange', icon='fire', prefix='fa'),
+            tooltip="Hypothetical Fire Station"
+        ).add_to(hyp_layer)
+        hyp_layer.add_to(m)
+
+    # Distance rings around all stations
+    all_station_coords = []
+    if fire_stations_proj is not None and not fire_stations_proj.empty:
+        s_wgs84 = fire_stations_proj.to_crs("EPSG:4326")
+        for _, row in s_wgs84.iterrows():
+            pt = row.geometry.centroid
+            all_station_coords.append((pt.y, pt.x))
+    if extra_station is not None:
+        all_station_coords.append((extra_station[0], extra_station[1]))
+
+    if all_station_coords:
+        ring_layer = folium.FeatureGroup(name="Response Distance Rings")
+        ring_colors = {500: '#00cc44', 1000: '#ffaa00', 1500: '#ff4444'}
+        for lat, lon in all_station_coords:
+            for radius_m, color in ring_colors.items():
+                folium.Circle(
+                    location=[lat, lon],
+                    radius=radius_m,
+                    color=color,
+                    fill=False,
+                    weight=1.5,
+                    dash_array='6',
+                    tooltip=f"{radius_m}m response zone"
+                ).add_to(ring_layer)
+        ring_layer.add_to(m)
+
+    m.add_child(colormap)
+    folium.LayerControl(collapsed=False).add_to(m)
     m.save('interactive_risk_map.html')
 
-def main(place_name, location_point, search_distance, weights, road_types=None, extra_station=None):
+def main(place_name, location_point, search_distance, weights, road_types=None, extra_station=None, wind_direction=None):
     """Orchestrates the entire analysis and map generation. Returns the final risk grid."""
     gdf_wgs84 = gpd.GeoDataFrame(geometry=[Point(location_point[1], location_point[0])], crs="EPSG:4326")
     target_crs = gdf_wgs84.estimate_utm_crs()
@@ -221,13 +356,15 @@ def main(place_name, location_point, search_distance, weights, road_types=None, 
     if graph is None or buildings.empty:
         raise ValueError("No buildings or road network found. Cannot generate analysis.")
     density_grid = calculate_density_grid(buildings)
-    buildings_with_travel_risk = calculate_travel_risk(buildings, fire_stations, graph, extra_station)
+    buildings_with_heights = calculate_height_risk(buildings)
+    buildings_with_travel_risk = calculate_travel_risk(buildings_with_heights, fire_stations, graph, extra_station)
     buildings_with_all_risks = calculate_water_risk(buildings_with_travel_risk, water_sources)
     final_risk_grid = calculate_composite_risk(density_grid, buildings_with_all_risks, weights)
+    final_risk_grid = apply_wind_modifier(final_risk_grid, wind_direction)
     save_footprints_map(buildings, graph, 'building_footprints.png')
     save_roads_map(accessible_roads, graph, 'road_network.png')
     generate_static_risk_map(final_risk_grid, graph)
-    generate_interactive_risk_map(final_risk_grid)
+    generate_interactive_risk_map(final_risk_grid, fire_stations, water_sources, extra_station)
     return final_risk_grid
 
 if __name__ == "__main__":
