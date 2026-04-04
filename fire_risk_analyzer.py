@@ -339,14 +339,19 @@ def generate_interactive_risk_map(grid, fire_stations_proj=None, water_sources_p
     print("Generating interactive risk map...")
     grid_wgs84 = grid.to_crs("EPSG:4326")
     map_center = [grid_wgs84.centroid.y.mean(), grid_wgs84.centroid.x.mean()]
-    m = folium.Map(location=map_center, zoom_start=15, tiles="CartoDB positron")
 
-    # Satellite base layer
+    # tiles=None so BOTH base layers appear properly in LayerControl
+    m = folium.Map(location=map_center, zoom_start=15, tiles=None)
+
+    # Base layer 1 – Street map (default / shown first)
+    folium.TileLayer('CartoDB positron', name='Street Map', overlay=False).add_to(m)
+
+    # Base layer 2 – Satellite
     folium.TileLayer(
         tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
         attr='Esri World Imagery',
         name='Satellite',
-        overlay=False
+        overlay=False,
     ).add_to(m)
 
     colormap = cm.LinearColormap(colors=['green', 'yellow', 'red'], vmin=grid['final_risk'].min(), vmax=grid['final_risk'].max())
@@ -461,7 +466,27 @@ def generate_interactive_risk_map(grid, fire_stations_proj=None, water_sources_p
             print(f"Road overlay skipped: {e}")
 
     m.add_child(colormap)
-    folium.LayerControl(collapsed=False).add_to(m)
+
+    # collapsed=True → compact icon button; never gets clipped by the Streamlit iframe
+    folium.LayerControl(collapsed=True, position='topright').add_to(m)
+
+    # Inject CSS so the layer control is always visible on top inside the iframe
+    css_fix = """
+    <style>
+    .leaflet-control-layers {
+        z-index: 9999 !important;
+        max-height: 90vh;
+        overflow-y: auto;
+    }
+    .leaflet-control-layers-expanded {
+        padding: 8px 10px;
+        font-size: 13px;
+        min-width: 160px;
+    }
+    </style>
+    """
+    m.get_root().html.add_child(folium.Element(css_fix))
+
     m.save('interactive_risk_map.html')
 
 def main(place_name, location_point, search_distance, weights, road_types=None, extra_station=None, wind_direction=None):
