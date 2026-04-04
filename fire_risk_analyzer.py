@@ -149,20 +149,35 @@ def calculate_occupancy_modifier(buildings_proj):
 def calculate_road_width_modifier(density_grid, accessible_roads):
     """Cells with fewer-lane roads get a narrow-road access penalty."""
     grid = density_grid.copy()
+    grid['avg_lanes'] = 2.0  # safe default for all cells
     if accessible_roads is None or accessible_roads.empty:
-        grid['avg_lanes'] = 2.0
         return grid
-    roads = accessible_roads.copy()
-    def _parse_lanes(v):
-        if isinstance(v, list): v = v[0]
-        try: return float(v)
-        except: return 1.0
-    roads['lanes_num'] = roads['lanes'].apply(_parse_lanes) if 'lanes' in roads.columns else 1.0
-    road_pts = roads[['geometry', 'lanes_num']].copy()
-    road_pts['geometry'] = road_pts.geometry.centroid
-    joined = gpd.sjoin(road_pts, grid.reset_index(), how='left', predicate='within')
-    avg = joined.groupby('index_right')['lanes_num'].mean()
-    grid['avg_lanes'] = avg.reindex(grid.index).fillna(2.0)
+    try:
+        def _parse_lanes(v):
+            if isinstance(v, list): v = v[0]
+            try: return float(v)
+            except: return 1.0
+
+        lanes_vals = accessible_roads['lanes'].apply(_parse_lanes) \
+            if 'lanes' in accessible_roads.columns \
+            else pd.Series(1.0, index=accessible_roads.index)
+
+        road_pts = gpd.GeoDataFrame(
+            {'lanes_num': lanes_vals.values},
+            geometry=accessible_roads.geometry.centroid,
+            crs=accessible_roads.crs
+        ).reset_index(drop=True)
+
+        # Join road centroids to grid polygons using only the geometry column
+        # so geopandas creates a clean 'index_right' mapped to grid.index
+        grid_geom = grid[['geometry']].copy()
+        joined = gpd.sjoin(road_pts, grid_geom, how='inner', predicate='within')
+
+        if 'index_right' in joined.columns and not joined.empty:
+            avg = joined.groupby('index_right')['lanes_num'].mean()
+            grid.loc[avg.index, 'avg_lanes'] = avg.values
+    except Exception as e:
+        print(f"Road width modifier skipped: {e}")
     return grid
 
 def apply_wind_modifier(risk_grid, wind_direction_deg):
