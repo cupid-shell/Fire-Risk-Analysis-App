@@ -15,6 +15,55 @@ ox.settings.requests_timeout = 180
 
 DEFAULT_ROAD_TYPES = ['primary', 'secondary', 'tertiary', 'residential', 'service', 'unclassified']
 
+# ── IMPROVEMENT 1: Absolute threshold normalization (NFPA/ISO anchors) ────────
+# NFPA 1710: fire stations should reach any point within 4 min travel time (240s)
+# ISO/TR 13387: hydrant spacing ≤ 150m in dense urban areas; ≥ 500m = max water risk
+# UN-Habitat: > 120 buildings per hectare = critically dense; cell is 50x50m = 0.25ha → 30 buildings = critical
+ACCESS_MAX_S      = 240.0   # seconds travel time — beyond this = full access risk (NFPA 1710, 4 min)
+WATER_MAX_M       = 500.0   # metres to nearest water — beyond this = full water risk (ISO/TR 13387)
+DENSITY_MAX       = 30.0    # buildings per 50×50 m cell — at or above this = full density risk (UN-Habitat)
+HAZARD_MAX_M      = 50.0    # metres to hazard — at or closer than this = full hazard risk
+HAZARD_SAFE_M     = 2000.0  # metres — beyond this = zero hazard risk
+HEIGHT_MAX_FLOORS = 10.0    # floors — at or above this = full height risk
+
+# Legacy alias kept for any callers that may reference the old name
+ACCESS_MAX_M = ACCESS_MAX_S
+
+
+def _clip_norm(series, lo, hi):
+    """Linearly scales series from [lo, hi] to [0, 1], clamped."""
+    if hi == lo:
+        return pd.Series(0.0, index=series.index)
+    return ((series - lo) / (hi - lo)).clip(0, 1)
+
+
+# ── IMPROVEMENT 2: AHP weight derivation with Consistency Ratio check ─────────
+def ahp_weights(pairwise_matrix):
+    """
+    Derives normalised weights from a 5×5 AHP pairwise comparison matrix.
+    Returns (weights_dict, consistency_ratio).
+    Saaty random index values for n=1..10:
+    RI = [0, 0, 0.58, 0.90, 1.12, 1.24, 1.32, 1.41, 1.45, 1.49]
+    CR < 0.10 is considered acceptable (Saaty, 1980).
+    """
+    A = np.array(pairwise_matrix, dtype=float)
+    n = A.shape[0]
+    # Column-normalise
+    col_sums = A.sum(axis=0)
+    norm = A / col_sums
+    # Priority vector = row means
+    weights = norm.mean(axis=1)
+    # Consistency check
+    Aw = A @ weights
+    lambda_max = (Aw / weights).mean()
+    CI = (lambda_max - n) / (n - 1)
+    RI_values = [0, 0, 0.58, 0.90, 1.12, 1.24, 1.32, 1.41, 1.45, 1.49]
+    RI = RI_values[n - 1]
+    CR = CI / RI if RI > 0 else 0.0
+    factor_names = ['density', 'access', 'water', 'height', 'hazard']
+    return dict(zip(factor_names, weights)), CR
+
+
 def get_geospatial_data(location_point, distance, target_crs, road_types=None):
     """
     Downloads and projects all necessary data, handling cases where features are not found.
@@ -25,6 +74,9 @@ def get_geospatial_data(location_point, distance, target_crs, road_types=None):
     print(f"Fetching data within {distance}m of {location_point}...")
     try:
         graph = ox.graph_from_point(location_point, dist=distance, network_type='all')
+        # IMPROVEMENT 3: add travel time attributes
+        graph = ox.add_edge_speeds(graph)
+        graph = ox.add_edge_travel_times(graph)
         graph_proj = ox.project_graph(graph, to_crs=target_crs)
         edges = ox.graph_to_gdfs(graph_proj, nodes=False)
         accessible_roads = edges[edges['highway'].isin(road_types)]
@@ -60,6 +112,7 @@ def get_geospatial_data(location_point, distance, target_crs, road_types=None):
     return graph_proj, buildings_proj, accessible_roads, water_sources_proj, fire_stations_proj
 
 
+# ── IMPROVEMENT 4: GFA + Building material combustibility ─────────────────────
 def calculate_density_grid(buildings_proj, cell_size=50):
     if buildings_proj.empty:
         print("No buildings to process for density grid.")
@@ -72,19 +125,78 @@ def calculate_density_grid(buildings_proj, cell_size=50):
             x1, y1 = x0 - cell_size, y0 + cell_size
             grid_cells.append(Polygon([(x0, y0), (x0, y1), (x1, y1), (x1, y0)]))
     grid = gpd.GeoDataFrame(grid_cells, columns=['geometry'], crs=buildings_proj.crs)
-    buildings_centroids = buildings_proj.copy()
+
+    # Compute footprint area and GFA
+    b = buildings_proj.copy()
+    b['footprint_area'] = b.geometry.area
+    if 'levels' in b.columns:
+        b['gfa'] = b['footprint_area'] * pd.to_numeric(b['levels'], errors='coerce').fillna(1)
+    elif 'building:levels' in b.columns:
+        b['gfa'] = b['footprint_area'] * pd.to_numeric(b['building:levels'], errors='coerce').fillna(1)
+    else:
+        b['gfa'] = b['footprint_area']
+
+    buildings_centroids = b.copy()
     buildings_centroids['geometry'] = buildings_centroids.geometry.centroid
+    buildings_centroids = buildings_centroids.reset_index(drop=True)
+
     merged = gpd.sjoin(buildings_centroids, grid, how='left', predicate='within')
     merged['n_buildings'] = 1
-    building_counts = merged.groupby('index_right')['n_buildings'].sum().reset_index()
+
+    agg_dict = {'n_buildings': 'sum', 'gfa': 'sum'}
+    if 'combustibility' in merged.columns:
+        agg_dict['combustibility'] = 'mean'
+
+    building_counts = merged.groupby('index_right').agg(agg_dict).reset_index()
+    building_counts = building_counts.rename(columns={
+        'gfa': 'total_gfa',
+        'combustibility': 'avg_combustibility',
+    })
+
     grid = grid.merge(building_counts, left_index=True, right_on='index_right', how='left')
     grid = grid.drop(columns=['index_right'])
     grid['n_buildings'] = grid['n_buildings'].fillna(0)
+    grid['total_gfa'] = grid['total_gfa'].fillna(0)
+
     print("Density calculation complete!")
     return grid
 
+
+def calculate_combustibility(buildings_proj):
+    """
+    Assigns a combustibility score per building based on OSM building:material tag.
+    Higher score = more combustible.
+    Reference: SFPE Handbook of Fire Protection Engineering.
+    """
+    MATERIAL_SCORES = {
+        'wood': 1.0, 'timber': 1.0, 'bamboo': 1.0,
+        'brick': 0.4, 'concrete': 0.2, 'stone': 0.1,
+        'metal': 0.3, 'steel': 0.2, 'glass': 0.3,
+    }
+    b = buildings_proj.copy()
+    mat_col = 'building:material' if 'building:material' in b.columns else None
+    if mat_col:
+        b['combustibility'] = b[mat_col].str.lower().map(MATERIAL_SCORES).fillna(0.5)
+    else:
+        b['combustibility'] = 0.5  # unknown = medium
+
+    # Also factor in building use type
+    USE_SCORES = {
+        'industrial': 0.9, 'warehouse': 0.9, 'retail': 0.7,
+        'commercial': 0.6, 'residential': 0.5, 'apartments': 0.5,
+        'hotel': 0.6, 'school': 0.6, 'hospital': 0.5,
+        'church': 0.4, 'government': 0.3, 'yes': 0.5,
+    }
+    if 'building' in b.columns:
+        use_score = b['building'].str.lower().map(USE_SCORES).fillna(0.5)
+        b['combustibility'] = (b['combustibility'] * 0.6 + use_score * 0.4)
+
+    return b
+
+
+# ── IMPROVEMENT 3: Travel TIME instead of travel DISTANCE ─────────────────────
 def calculate_travel_risk(buildings_proj, fire_stations_proj, graph_proj, extra_station=None):
-    print("Calculating travel distance risk from fire stations...")
+    print("Calculating travel time risk from fire stations...")
     stations = fire_stations_proj.copy()
 
     if extra_station is not None:
@@ -96,26 +208,27 @@ def calculate_travel_risk(buildings_proj, fire_stations_proj, graph_proj, extra_
         stations = pd.concat([stations, extra_pt], ignore_index=True) if not stations.empty else extra_pt
 
     if stations.empty:
-        print("No fire stations found. Assigning high-risk distance.")
+        print("No fire stations found. Assigning high-risk travel time.")
         buildings_with_risk = buildings_proj.copy()
-        buildings_with_risk['travel_distance'] = 5000
+        buildings_with_risk['travel_time'] = 480  # 8 minutes = well beyond NFPA 4-min standard
         return buildings_with_risk
 
     fire_station_points = stations.copy()
     fire_station_points['geometry'] = fire_station_points.geometry.centroid
     station_nodes = ox.nearest_nodes(graph_proj, fire_station_points.geometry.x, fire_station_points.geometry.y)
     building_nodes = ox.nearest_nodes(graph_proj, buildings_proj.geometry.centroid.x, buildings_proj.geometry.centroid.y)
-    travel_distances = []
+    travel_times = []
     for b_node in building_nodes:
         try:
-            path_length = min([nx.shortest_path_length(graph_proj, b_node, s_node, weight='length') for s_node in np.atleast_1d(station_nodes)])
-            travel_distances.append(path_length)
+            path_time = min([nx.shortest_path_length(graph_proj, b_node, s_node, weight='travel_time') for s_node in np.atleast_1d(station_nodes)])
+            travel_times.append(path_time)
         except (nx.NetworkXNoPath, nx.NodeNotFound):
-            travel_distances.append(5000)
+            travel_times.append(480)
     buildings_with_risk = buildings_proj.copy()
-    buildings_with_risk['travel_distance'] = travel_distances
+    buildings_with_risk['travel_time'] = travel_times
     print("Travel risk calculation complete!")
     return buildings_with_risk
+
 
 def calculate_water_risk(buildings_proj, water_sources_proj):
     print("Calculating water proximity risk...")
@@ -129,15 +242,59 @@ def calculate_water_risk(buildings_proj, water_sources_proj):
     print("Water risk calculation complete!")
     return buildings_with_risk
 
+
+# ── IMPROVEMENT 10: Weighted hazard scoring by type ───────────────────────────
 def calculate_hazard_risk(buildings_proj, hazards_proj):
-    """Proximity to hazard points (gas stations, hospitals, schools) — closer = higher risk."""
+    """
+    Proximity-weighted hazard risk using type-specific danger multipliers.
+    Score = Σ(multiplier_i / max(distance_i, 10)²) — inverse square decay.
+
+    Multipliers based on fire hazard potential:
+    - fuel/gas station: 3.0 (flammable fuel storage, SFPE Handbook)
+    - hospital: 2.0 (critical infrastructure, hazardous materials)
+    - marketplace: 1.5 (dense combustible goods, high occupancy)
+    - school: 1.0 (high occupancy, evacuation complexity)
+
+    Reference: SFPE Handbook of Fire Protection Engineering, 5th Ed.
+    """
     b = buildings_proj.copy()
     if hazards_proj is None or hazards_proj.empty:
-        b['distance_to_hazard'] = 2000
+        b['hazard_score'] = 0.0
+        b['distance_to_hazard'] = 2000.0
         return b
-    combined = hazards_proj.union_all()
-    b['distance_to_hazard'] = b.geometry.apply(lambda g: g.centroid.distance(combined))
+
+    HAZARD_WEIGHTS = {
+        'fuel':        3.0,
+        'hospital':    2.0,
+        'marketplace': 1.5,
+        'school':      1.0,
+    }
+
+    hazards = hazards_proj.copy()
+    hazards['geometry'] = hazards.geometry.centroid
+
+    # Get amenity type
+    if 'amenity' in hazards.columns:
+        hazards['h_weight'] = hazards['amenity'].map(HAZARD_WEIGHTS).fillna(1.0)
+    else:
+        hazards['h_weight'] = 1.0
+
+    def _hazard_score(geom):
+        pt = geom.centroid
+        total = 0.0
+        min_dist = float('inf')
+        for _, h in hazards.iterrows():
+            d = max(pt.distance(h.geometry), 10.0)
+            total += h['h_weight'] / (d ** 2) * 10000  # scale factor
+            min_dist = min(min_dist, d)
+        return total, min_dist if min_dist != float('inf') else 2000.0
+
+    scores = b.geometry.apply(_hazard_score)
+    b['hazard_score'] = scores.apply(lambda x: x[0])
+    b['distance_to_hazard'] = scores.apply(lambda x: x[1])
+
     return b
+
 
 def calculate_occupancy_modifier(buildings_proj):
     """Estimates occupancy from floor count × footprint area. Used to boost density risk."""
@@ -145,6 +302,7 @@ def calculate_occupancy_modifier(buildings_proj):
     levels = b['levels'] if 'levels' in b.columns else pd.Series(1.0, index=b.index)
     b['occupancy_proxy'] = (levels * b.geometry.area / 25.0).clip(lower=1)
     return b
+
 
 def calculate_road_width_modifier(density_grid, accessible_roads):
     """Cells with fewer-lane roads get a narrow-road access penalty."""
@@ -180,6 +338,7 @@ def calculate_road_width_modifier(density_grid, accessible_roads):
         print(f"Road width modifier skipped: {e}")
     return grid
 
+
 def apply_wind_modifier(risk_grid, wind_direction_deg):
     """
     Applies a directional wind multiplier to final_risk.
@@ -207,6 +366,7 @@ def apply_wind_modifier(risk_grid, wind_direction_deg):
     grid = grid.drop(columns=['_cx', '_cy'])
     return grid
 
+
 def calculate_height_risk(buildings_proj):
     """Extracts building:levels from OSM tags and returns per-building height risk."""
     b = buildings_proj.copy()
@@ -216,78 +376,305 @@ def calculate_height_risk(buildings_proj):
         b['levels'] = 1
     return b
 
-def calculate_composite_risk(density_grid, buildings_with_all_risks, weights):
+
+# ── IMPROVEMENT 5: Jenks Natural Breaks risk bands ────────────────────────────
+def classify_risk_bands(grid, n_classes=4):
+    """
+    Classifies final_risk into bands using Jenks Natural Breaks (Fisher-Jenks),
+    a statistically optimal classification that minimises within-class variance.
+    Falls back to fixed quantile thresholds if insufficient data.
+    Reference: Jenks & Caspall (1971), Cartographica.
+    """
+    scores = grid['final_risk'].dropna().values
+
+    if len(scores) >= n_classes * 2:
+        try:
+            import jenkspy
+            breaks = jenkspy.jenks_breaks(scores, n_classes=n_classes)
+            # breaks has n_classes+1 values: [min, break1, break2, break3, max]
+            def _band_jenks(s):
+                if s <= breaks[1]: return 'Low'
+                if s <= breaks[2]: return 'Medium'
+                if s <= breaks[3]: return 'High'
+                return 'Critical'
+            grid = grid.copy()
+            grid['risk_band'] = grid['final_risk'].apply(_band_jenks)
+            grid['jenks_breaks'] = str([round(b, 3) for b in breaks])
+            return grid
+        except ImportError:
+            pass  # fall back below
+
+    # Fallback: quantile-based (better than fixed thresholds)
+    q25, q50, q75 = grid['final_risk'].quantile([0.25, 0.5, 0.75])
+
+    def _band_q(s):
+        if s >= q75: return 'Critical'
+        if s >= q50: return 'High'
+        if s >= q25: return 'Medium'
+        return 'Low'
+
+    grid = grid.copy()
+    grid['risk_band'] = grid['final_risk'].apply(_band_q)
+    return grid
+
+
+# ── IMPROVEMENT 9: OSM data completeness flag ─────────────────────────────────
+def assess_data_completeness(buildings_proj, density_grid):
+    """
+    Estimates OSM data completeness per grid cell.
+    Uses building footprint coverage ratio as a proxy:
+    if a cell has buildings but very small total footprint area relative to
+    the cell area, data may be incomplete.
+
+    Returns grid with 'completeness_score' (0=low confidence, 1=high confidence)
+    and 'data_warning' flag.
+    """
+    grid = density_grid.copy()
+    cell_area = 50 * 50  # 2500 m² per cell
+
+    # Compute total footprint area per cell
+    try:
+        b = buildings_proj.copy()
+        b['footprint_area'] = b.geometry.area
+        b_centroids = b.copy()
+        b_centroids['geometry'] = b_centroids.geometry.centroid
+        b_centroids = b_centroids.reset_index(drop=True)
+        grid_geom = grid[['geometry']].copy()
+        joined = gpd.sjoin(b_centroids[['geometry', 'footprint_area']], grid_geom, how='left', predicate='within')
+        if 'index_right' in joined.columns:
+            total_fp = joined.groupby('index_right')['footprint_area'].sum()
+            grid['total_footprint_area'] = 0.0
+            grid.loc[total_fp.index, 'total_footprint_area'] = total_fp.values
+        else:
+            grid['total_footprint_area'] = 0.0
+    except Exception:
+        grid['total_footprint_area'] = 0.0
+
+    # Coverage ratio: what fraction of the cell is covered by building footprints?
+    grid['coverage_ratio'] = (grid['total_footprint_area'] / cell_area).clip(0, 1)
+
+    # Completeness heuristic:
+    # - Cell with buildings but coverage < 1% → possibly sparse OSM data
+    # - Cell with 0 buildings but in the middle of the study area → possibly missing data
+    # - Well-mapped urban areas typically have 5-40% building coverage
+    grid['completeness_score'] = 1.0  # default: high confidence
+
+    # Low coverage in populated cells suggests missing data
+    low_coverage = (grid['n_buildings'] > 0) & (grid['coverage_ratio'] < 0.01)
+    grid.loc[low_coverage, 'completeness_score'] = 0.4
+
+    # Zero buildings in interior cells (surrounded by cells with buildings) may be unmapped
+    # Simple proxy: cells with 0 buildings get moderate uncertainty
+    grid.loc[grid['n_buildings'] == 0, 'completeness_score'] = 0.6
+
+    grid['data_warning'] = grid['completeness_score'] < 0.5
+
+    return grid
+
+
+# ── IMPROVEMENT 8: Moran's I spatial autocorrelation ─────────────────────────
+def calculate_spatial_autocorrelation(risk_grid):
+    """
+    Computes Moran's I statistic for spatial autocorrelation of final_risk scores.
+    A positive Moran's I indicates spatial clustering of high-risk zones.
+    Reference: Moran (1950), Biometrika; Anselin (1995) for LISA.
+    Returns dict with moran_i, p_value, interpretation.
+    """
+    try:
+        from libpysal.weights import Queen
+        from esda.moran import Moran
+
+        grid = risk_grid.copy()
+        # Build spatial weights matrix (Queen contiguity)
+        w = Queen.from_dataframe(grid, silence_warnings=True)
+        w.transform = 'r'  # row-standardise
+
+        moran = Moran(grid['final_risk'], w)
+
+        if moran.p_sim < 0.01:
+            sig = "highly significant (p < 0.01)"
+        elif moran.p_sim < 0.05:
+            sig = "significant (p < 0.05)"
+        else:
+            sig = "not significant (p ≥ 0.05)"
+
+        if moran.I > 0.3:
+            interp = "Strong spatial clustering — high-risk zones form concentrated hotspot clusters."
+        elif moran.I > 0.1:
+            interp = "Moderate spatial clustering — some tendency for high-risk zones to neighbour each other."
+        elif moran.I > 0:
+            interp = "Weak spatial clustering."
+        else:
+            interp = "Spatial dispersion — high-risk zones are scattered rather than clustered."
+
+        return {
+            'moran_i': round(float(moran.I), 4),
+            'p_value': round(float(moran.p_sim), 4),
+            'significance': sig,
+            'interpretation': interp,
+            'z_score': round(float(moran.z_sim), 3),
+        }
+    except ImportError:
+        return {'error': 'Install libpysal and esda: pip install libpysal esda'}
+    except Exception as e:
+        return {'error': str(e)}
+
+
+# ── IMPROVEMENT 6: Weighted geometric mean aggregation + IMPROVEMENT 1 norms ──
+def calculate_composite_risk(density_grid, buildings_with_all_risks, weights, aggregation='weighted_sum'):
     print("Calculating composite risk score...")
     grid = density_grid.reset_index(drop=True)
 
-    if buildings_with_all_risks.empty or 'travel_distance' not in buildings_with_all_risks.columns:
-        grid['avg_travel_distance'] = 0
+    # Determine which travel column is present (travel_time is new, travel_distance legacy)
+    travel_col = 'travel_time' if 'travel_time' in buildings_with_all_risks.columns else 'travel_distance'
+
+    if buildings_with_all_risks.empty or travel_col not in buildings_with_all_risks.columns:
+        grid['avg_travel_time'] = 0
         grid['avg_distance_water'] = 0
     else:
         buildings_centroids = buildings_with_all_risks.copy()
         buildings_centroids['geometry'] = buildings_centroids.geometry.centroid
+        buildings_centroids = buildings_centroids.reset_index(drop=True)
         merged = gpd.sjoin(buildings_centroids, grid, how='left', predicate='within')
-        agg_cols = ['travel_distance', 'distance_to_water']
-        for col in ['levels', 'distance_to_hazard', 'occupancy_proxy']:
+        agg_cols = [travel_col, 'distance_to_water']
+        for col in ['levels', 'distance_to_hazard', 'occupancy_proxy', 'hazard_score', 'combustibility']:
             if col in buildings_centroids.columns:
                 agg_cols.append(col)
         avg_risks_in_grid = merged.groupby('index_right')[agg_cols].mean()
         grid = grid.join(avg_risks_in_grid)
 
-    grid = grid.rename(columns={'travel_distance': 'avg_travel_distance', 'distance_to_water': 'avg_distance_water'})
-    for col in ['avg_travel_distance', 'avg_distance_water']:
+    # Rename for unified reference
+    if travel_col in grid.columns:
+        grid = grid.rename(columns={travel_col: 'avg_travel_time'})
+    if 'distance_to_water' in grid.columns:
+        grid = grid.rename(columns={'distance_to_water': 'avg_distance_water'})
+    if 'hazard_score' in grid.columns:
+        grid = grid.rename(columns={'hazard_score': 'avg_hazard_score'})
+    if 'combustibility' in grid.columns:
+        grid = grid.rename(columns={'combustibility': 'avg_combustibility'})
+
+    for col in ['avg_travel_time', 'avg_distance_water']:
+        if col not in grid.columns:
+            grid[col] = 0
         grid[col] = grid[col].fillna(0)
 
-    def _norm(series):
-        mn, mx = series.min(), series.max()
-        return (series - mn) / (mx - mn) if mx > mn else pd.Series(0.0, index=series.index)
-
-    grid['density_risk'] = _norm(grid['n_buildings'])
+    # IMPROVEMENT 1: Absolute threshold normalization
+    # Density risk — prefer GFA if available
+    if 'total_gfa' in grid.columns and grid['total_gfa'].sum() > 0:
+        grid['density_risk'] = _clip_norm(grid['total_gfa'], 0, DENSITY_MAX * 50 * 50)  # GFA in m²
+    else:
+        grid['density_risk'] = _clip_norm(grid['n_buildings'], 0, DENSITY_MAX)
 
     # Occupancy modifier — boosts density risk by up to 50% for high-occupancy buildings
     if 'occupancy_proxy' in grid.columns:
         grid['occupancy_proxy'] = grid['occupancy_proxy'].fillna(1)
-        occ_norm = _norm(grid['occupancy_proxy'])
+        occ_norm = _clip_norm(grid['occupancy_proxy'], grid['occupancy_proxy'].min(), grid['occupancy_proxy'].max())
         grid['density_risk'] = (grid['density_risk'] * (1 + occ_norm * 0.5)).clip(0, 1)
 
-    grid['access_risk'] = _norm(grid['avg_travel_distance'])
+    # IMPROVEMENT 4: Apply combustibility modifier
+    if 'avg_combustibility' in grid.columns:
+        grid['density_risk'] = (grid['density_risk'] * (1 + grid['avg_combustibility'].fillna(0.5) * 0.5)).clip(0, 1)
+
+    # Access risk — use absolute threshold (NFPA 1710: 240 seconds)
+    grid['access_risk'] = _clip_norm(grid['avg_travel_time'], 0, ACCESS_MAX_S)
 
     # Road width modifier — narrow roads boost access risk by up to 30%
     if 'avg_lanes' in grid.columns:
         grid['avg_lanes'] = grid['avg_lanes'].fillna(2)
-        narrow_penalty = (1 / grid['avg_lanes'].clip(lower=0.5)).pipe(_norm)
-        grid['access_risk'] = (grid['access_risk'] * (1 + narrow_penalty * 0.3)).clip(0, 1)
+        lane_penalty = _clip_norm(1.0 / grid['avg_lanes'].clip(lower=0.5), 0, 2)
+        grid['access_risk'] = (grid['access_risk'] * (1 + lane_penalty * 0.3)).clip(0, 1)
 
-    grid['water_risk'] = _norm(grid['avg_distance_water'])
+    # Water risk — use absolute threshold (ISO/TR 13387: 500m)
+    grid['water_risk'] = _clip_norm(grid['avg_distance_water'], 0, WATER_MAX_M)
 
+    # Height risk — use reference of 10 floors = max
     if 'levels' in grid.columns and weights.get('height', 0) > 0:
         grid['levels'] = grid['levels'].fillna(1)
-        grid['height_risk'] = _norm(grid['levels'])
+        grid['height_risk'] = _clip_norm(grid['levels'], 1, HEIGHT_MAX_FLOORS)
     else:
         grid['height_risk'] = 0.0
 
-    if 'distance_to_hazard' in grid.columns and weights.get('hazard', 0) > 0:
-        grid['distance_to_hazard'] = grid['distance_to_hazard'].fillna(2000)
-        grid['hazard_risk'] = _norm(-grid['distance_to_hazard'])  # closer = higher risk
+    # IMPROVEMENT 10: Hazard risk — use weighted score if available, else distance-based
+    if 'avg_hazard_score' in grid.columns and weights.get('hazard', 0) > 0:
+        p95 = grid['avg_hazard_score'].quantile(0.95)
+        if p95 > 0:
+            grid['hazard_risk'] = _clip_norm(grid['avg_hazard_score'].fillna(0), 0, p95)
+        else:
+            grid['hazard_risk'] = 0.0
+    elif 'distance_to_hazard' in grid.columns and weights.get('hazard', 0) > 0:
+        grid['distance_to_hazard'] = grid['distance_to_hazard'].fillna(HAZARD_SAFE_M)
+        grid['hazard_risk'] = _clip_norm(-grid['distance_to_hazard'], -HAZARD_SAFE_M, -HAZARD_MAX_M)
     else:
         grid['hazard_risk'] = 0.0
 
-    grid['final_risk'] = (
-        grid['density_risk'] * weights.get('density', 0) +
-        grid['access_risk']  * weights.get('access',  0) +
-        grid['water_risk']   * weights.get('water',   0) +
-        grid['height_risk']  * weights.get('height',  0) +
-        grid['hazard_risk']  * weights.get('hazard',  0)
-    ).clip(0, 1)
+    # IMPROVEMENT 6: Aggregation method
+    if aggregation == 'geometric_mean':
+        # Weighted geometric mean: product of (risk_i ^ weight_i)
+        # Handles factor interactions — poor performance on any single factor pulls down total
+        risk_factors = {
+            'density': grid['density_risk'],
+            'access':  grid['access_risk'],
+            'water':   grid['water_risk'],
+            'height':  grid['height_risk'],
+            'hazard':  grid['hazard_risk'],
+        }
+        log_sum = sum(
+            weights.get(k, 0) * np.log(v.clip(lower=1e-6))
+            for k, v in risk_factors.items()
+        )
+        grid['final_risk'] = np.exp(log_sum).clip(0, 1)
+    else:
+        # Default: weighted arithmetic sum
+        grid['final_risk'] = (
+            grid['density_risk'] * weights.get('density', 0) +
+            grid['access_risk']  * weights.get('access',  0) +
+            grid['water_risk']   * weights.get('water',   0) +
+            grid['height_risk']  * weights.get('height',  0) +
+            grid['hazard_risk']  * weights.get('hazard',  0)
+        ).clip(0, 1)
 
-    def _band(s):
-        if s >= 0.75: return 'Critical'
-        if s >= 0.50: return 'High'
-        if s >= 0.25: return 'Medium'
-        return 'Low'
+    # IMPROVEMENT 5: Jenks Natural Breaks risk bands
+    grid = classify_risk_bands(grid)
 
-    grid['risk_band'] = grid['final_risk'].apply(_band)
     return grid
+
+
+# ── IMPROVEMENT 7: Monte Carlo uncertainty bounds ─────────────────────────────
+def monte_carlo_uncertainty(density_grid, buildings_with_all_risks, weights, n_simulations=300, weight_std=0.10):
+    """
+    Runs n_simulations of composite risk with weights perturbed by Gaussian noise
+    (std = weight_std fraction of each weight). Returns per-cell mean and std dev of final_risk.
+    This quantifies how sensitive risk scores are to weight uncertainty.
+    Reference: Saltelli et al. (2008), Global Sensitivity Analysis.
+    """
+    from copy import deepcopy
+
+    all_risks = []
+    factor_names = list(weights.keys())
+    w_array = np.array([weights[k] for k in factor_names])
+
+    for _ in range(n_simulations):
+        # Perturb weights with Gaussian noise, renormalise
+        noise = np.random.normal(0, weight_std, size=len(w_array))
+        w_perturbed = np.abs(w_array + noise * w_array)
+        w_sum = w_perturbed.sum()
+        if w_sum > 0:
+            w_perturbed /= w_sum
+        w_dict = dict(zip(factor_names, w_perturbed))
+
+        sim_grid = calculate_composite_risk(
+            deepcopy(density_grid), deepcopy(buildings_with_all_risks), w_dict
+        )
+        all_risks.append(sim_grid['final_risk'].values)
+
+    all_risks = np.array(all_risks)  # shape: (n_simulations, n_cells)
+    result_grid = density_grid.copy()
+    result_grid['risk_mean'] = all_risks.mean(axis=0)
+    result_grid['risk_std']  = all_risks.std(axis=0)
+    result_grid['risk_cv']   = (result_grid['risk_std'] / result_grid['risk_mean'].clip(lower=1e-6)).clip(0, 1)
+    # High CV = unstable/uncertain zone; low CV = stably classified
+    return result_grid[['geometry', 'risk_mean', 'risk_std', 'risk_cv']]
+
 
 def save_footprints_map(buildings, graph, filepath):
     print(f"Saving building footprints map to {filepath}...")
@@ -481,9 +868,11 @@ def main(place_name, location_point, search_distance, weights, road_types=None, 
     graph, buildings, accessible_roads, water_sources, fire_stations = get_geospatial_data(location_point, search_distance, target_crs, road_types)
     if graph is None or buildings.empty:
         raise ValueError("No buildings or road network found. Cannot generate analysis.")
-    density_grid = calculate_density_grid(buildings)
     buildings_with_heights = calculate_height_risk(buildings)
-    buildings_with_occ = calculate_occupancy_modifier(buildings_with_heights)
+    buildings_with_comb = calculate_combustibility(buildings_with_heights)
+    buildings_with_occ = calculate_occupancy_modifier(buildings_with_comb)
+    density_grid = calculate_density_grid(buildings_with_occ)
+    density_grid = assess_data_completeness(buildings_with_occ, density_grid)
     buildings_with_travel_risk = calculate_travel_risk(buildings_with_occ, fire_stations, graph, extra_station)
     buildings_with_water = calculate_water_risk(buildings_with_travel_risk, water_sources)
     buildings_with_all_risks = calculate_hazard_risk(buildings_with_water, None)

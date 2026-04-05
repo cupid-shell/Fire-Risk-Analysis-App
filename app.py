@@ -11,17 +11,28 @@ from fire_risk_analyzer import (
     calculate_density_grid,
     calculate_height_risk,
     calculate_occupancy_modifier,
+    calculate_combustibility,
     calculate_hazard_risk,
     calculate_travel_risk,
     calculate_water_risk,
     calculate_composite_risk,
     calculate_road_width_modifier,
     apply_wind_modifier,
+    assess_data_completeness,
+    calculate_spatial_autocorrelation,
+    monte_carlo_uncertainty,
+    ahp_weights,
     save_footprints_map,
     save_roads_map,
     generate_static_risk_map,
     generate_interactive_risk_map,
     DEFAULT_ROAD_TYPES,
+    ACCESS_MAX_S,
+    WATER_MAX_M,
+    DENSITY_MAX,
+    HAZARD_MAX_M,
+    HAZARD_SAFE_M,
+    HEIGHT_MAX_FLOORS,
 )
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -67,6 +78,8 @@ _defaults = {
     'last_weights': None, 'last_n_buildings': 0,
     'last_n_stations': 0, 'last_n_water': 0, 'last_n_hazards': 0,
     'last_recs': [], 'folium_map': None,
+    'mc_grid': None, 'moran_result': None,
+    'use_ahp': False, 'ahp_w': None,
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -156,6 +169,40 @@ with st.sidebar:
     else:
         st.warning("All weights are zero.")
 
+    # ── IMPROVEMENT 2: AHP Weight Derivation ──────────────────────────────────
+    with st.expander("🔬 AHP Weight Derivation (Scientific)"):
+        st.caption("Analytic Hierarchy Process (Saaty, 1980). Compare each pair of factors. 1=equal, 3=moderately more, 5=strongly more, 7=very strongly, 9=extremely more important.")
+        use_ahp = st.checkbox("Use AHP-derived weights instead of sliders")
+        if use_ahp:
+            factors = ['Density', 'Access', 'Water', 'Height', 'Hazard']
+            n = 5
+            ahp_matrix = [[1.0]*n for _ in range(n)]
+            for i in range(n):
+                for j in range(i+1, n):
+                    val = st.select_slider(
+                        f"{factors[i]} vs {factors[j]}",
+                        options=[1/9, 1/7, 1/5, 1/3, 1.0, 3.0, 5.0, 7.0, 9.0],
+                        value=1.0,
+                        format_func=lambda x: f"{x:.2g}",
+                        key=f"ahp_{i}_{j}"
+                    )
+                    ahp_matrix[i][j] = val
+                    ahp_matrix[j][i] = 1.0 / val
+
+            ahp_w, cr = ahp_weights(ahp_matrix)
+
+            if cr < 0.10:
+                st.success(f"Consistency Ratio: {cr:.3f} (acceptable < 0.10)")
+            else:
+                st.warning(f"Consistency Ratio: {cr:.3f} — revise comparisons (should be < 0.10)")
+
+            st.caption("Derived weights: " + " | ".join(f"{k.capitalize()}: {v:.1%}" for k, v in ahp_w.items()))
+            st.session_state.use_ahp = True
+            st.session_state.ahp_w = ahp_w
+        else:
+            st.session_state.use_ahp = False
+            st.session_state.ahp_w = None
+
     st.markdown("---")
 
     # ── Advanced Options ───────────────────────────────────────────────────────
@@ -176,6 +223,18 @@ with st.sidebar:
             _compass = {0:"N",45:"NE",90:"E",135:"SE",180:"S",225:"SW",270:"W",315:"NW"}
             _near = min(_compass, key=lambda k: abs(k - wind_direction))
             st.caption(f"Wind from: **{_compass[_near]}**")
+
+        # IMPROVEMENT 6: Risk Aggregation Method
+        st.markdown("**Risk Aggregation Method**")
+        aggregation_method = st.radio(
+            "Method:",
+            ['weighted_sum', 'geometric_mean'],
+            format_func=lambda x: '+ Weighted Sum (additive)' if x == 'weighted_sum' else 'x Geometric Mean (synergistic)',
+            help="Geometric mean penalises poor performance on any single factor more strongly than the additive model. Reference: UNDRR Global Risk Assessment Framework."
+        )
+
+        # IMPROVEMENT 7: Monte Carlo uncertainty
+        run_uncertainty = st.checkbox("Run Monte Carlo uncertainty analysis (slower, ~300 simulations)", value=False)
 
         st.markdown("**Hypothetical Fire Station**")
         add_station = st.checkbox("Simulate extra station")
@@ -200,7 +259,8 @@ with st.sidebar:
         for k in ['maps_generated', 'final_risk_grid', 'location_query',
                   'scenario_a', 'scenario_b', 'last_location_point',
                   'last_accessible_roads', 'last_weights', 'last_recs',
-                  'last_n_buildings', 'last_n_stations', 'last_n_water', 'last_n_hazards']:
+                  'last_n_buildings', 'last_n_stations', 'last_n_water', 'last_n_hazards',
+                  'mc_grid', 'moran_result', 'use_ahp', 'ahp_w']:
             st.session_state[k] = _defaults.get(k)
         st.rerun()
 
@@ -225,6 +285,9 @@ def fetch_all_osm_parallel(location_point, distance, road_types_tuple, target_ep
     def _graph():
         try:
             g  = ox.graph_from_point(location_point, dist=distance, network_type='all')
+            # IMPROVEMENT 3: add travel time attributes before projecting
+            g = ox.add_edge_speeds(g)
+            g = ox.add_edge_travel_times(g)
             gp = ox.project_graph(g, to_crs=target_epsg)
             edges = ox.graph_to_gdfs(gp, nodes=False)
             ar = edges[edges['highway'].isin(list(road_types_tuple))]
@@ -283,16 +346,20 @@ st.caption("Geospatial fire-risk scoring for urban settlements using OpenStreetM
 #  ANALYSIS (triggered from sidebar button)
 # ══════════════════════════════════════════════════════════════════════════════
 if analyse_clicked:
-    weights = {
-        "density": density_weight / 100, "access": access_weight / 100,
-        "water":   water_weight   / 100, "height": height_weight / 100,
-        "hazard":  hazard_weight  / 100,
-    }
-    total_w = sum(weights.values())
-    if total_w > 0:
-        weights = {k: v / total_w for k, v in weights.items()}
+    # IMPROVEMENT 2: use AHP weights if enabled
+    if st.session_state.get('use_ahp') and st.session_state.get('ahp_w'):
+        weights = st.session_state.ahp_w
     else:
-        st.error("All weights are zero — cannot run analysis."); st.stop()
+        weights = {
+            "density": density_weight / 100, "access": access_weight / 100,
+            "water":   water_weight   / 100, "height": height_weight / 100,
+            "hazard":  hazard_weight  / 100,
+        }
+        total_w = sum(weights.values())
+        if total_w > 0:
+            weights = {k: v / total_w for k, v in weights.items()}
+        else:
+            st.error("All weights are zero — cannot run analysis."); st.stop()
 
     if not selected_road_types:
         st.error("Select at least one road type in Advanced Options."); st.stop()
@@ -342,16 +409,20 @@ if analyse_clicked:
                 st.info("ℹ No hazard points found — hazard weight has no effect.")
 
             progress.progress(65, text="Calculating density grid…")
-            density_grid = calculate_density_grid(buildings)
-
-            progress.progress(69, text="Extracting building height & occupancy…")
             bh  = calculate_height_risk(buildings)
             bho = calculate_occupancy_modifier(bh)
+            # IMPROVEMENT 4: combustibility scoring
+            bho = calculate_combustibility(bho)
+            density_grid = calculate_density_grid(bho)
 
-            progress.progress(72, text="Applying road-width modifier…")
+            # IMPROVEMENT 9: OSM data completeness flag
+            density_grid = assess_data_completeness(bho, density_grid)
+
+            progress.progress(69, text="Applying road-width modifier…")
             density_grid = calculate_road_width_modifier(density_grid, accessible_roads)
 
-            progress.progress(75, text="Calculating travel distance to fire stations…")
+            # IMPROVEMENT 3: travel time
+            progress.progress(75, text="Calculating travel time to fire stations…")
             bt = calculate_travel_risk(bho, fire_stations, graph, extra_station)
 
             progress.progress(80, text="Calculating water proximity risk…")
@@ -361,18 +432,32 @@ if analyse_clicked:
             ba = calculate_hazard_risk(bw, hazards)
 
             progress.progress(86, text="Computing composite risk scores…")
-            final_risk_grid = calculate_composite_risk(density_grid, ba, weights)
+            # IMPROVEMENT 6: pass aggregation method
+            final_risk_grid = calculate_composite_risk(density_grid, ba, weights, aggregation=aggregation_method)
             if wind_direction is not None:
                 final_risk_grid = apply_wind_modifier(final_risk_grid, wind_direction)
 
-            progress.progress(90, text="Rendering static maps…")
+            # IMPROVEMENT 7: Monte Carlo uncertainty
+            if run_uncertainty:
+                progress.progress(88, text="Running Monte Carlo uncertainty analysis (300 simulations)…")
+                mc_grid = monte_carlo_uncertainty(density_grid, ba, weights)
+                st.session_state.mc_grid = mc_grid
+            else:
+                st.session_state.mc_grid = None
+
+            # IMPROVEMENT 8: Moran's I spatial autocorrelation
+            progress.progress(92, text="Computing spatial autocorrelation (Moran's I)…")
+            moran_result = calculate_spatial_autocorrelation(final_risk_grid)
+            st.session_state.moran_result = moran_result
+
+            progress.progress(93, text="Rendering static maps…")
             save_footprints_map(buildings, graph, 'building_footprints.png')
             save_roads_map(accessible_roads, graph, 'road_network.png')
 
-            progress.progress(94, text="Generating risk heatmap…")
+            progress.progress(96, text="Generating risk heatmap…")
             generate_static_risk_map(final_risk_grid, graph)
 
-            progress.progress(97, text="Generating interactive map…")
+            progress.progress(98, text="Generating interactive map…")
             folium_map = generate_interactive_risk_map(
                 final_risk_grid, fire_stations, water_sources, extra_station, accessible_roads
             )
@@ -501,6 +586,46 @@ if st.session_state.maps_generated and st.session_state.final_risk_grid is not N
         with d3: st.metric("Water Sources", st.session_state.last_n_water)
         with d4: st.metric("Hazard Points", st.session_state.last_n_hazards)
 
+        # IMPROVEMENT 5: Jenks break thresholds
+        if 'jenks_breaks' in frg.columns:
+            st.caption(f"Risk band thresholds (Jenks Natural Breaks): {frg['jenks_breaks'].iloc[0]}")
+        else:
+            st.caption("Risk band thresholds: quantile-based")
+
+        # IMPROVEMENT 9: OSM data completeness warning
+        low_conf_cells = int((frg['completeness_score'] < 0.5).sum()) if 'completeness_score' in frg.columns else 0
+        if low_conf_cells > 0:
+            st.warning(f"Data Completeness Warning: {low_conf_cells} grid cells have low OSM coverage confidence. Results in these cells should be interpreted cautiously. Consider field verification.")
+
+        st.markdown("---")
+
+        # IMPROVEMENT 7: Monte Carlo uncertainty metrics
+        if st.session_state.get('mc_grid') is not None:
+            mc = st.session_state.mc_grid
+            st.markdown("**Monte Carlo Uncertainty Analysis (n=300)**")
+            u1, u2, u3 = st.columns(3)
+            with u1: st.metric("Mean Risk (MC)", f"{mc['risk_mean'].mean():.3f}")
+            with u2: st.metric("Avg Uncertainty (σ)", f"{mc['risk_std'].mean():.3f}")
+            with u3:
+                stable_pct = (mc['risk_cv'] < 0.15).mean() * 100
+                st.metric("Stably Classified Cells", f"{stable_pct:.0f}%")
+            st.caption("Cells with coefficient of variation > 15% are sensitive to weight assumptions and should be interpreted cautiously.")
+            st.markdown("")
+
+        # IMPROVEMENT 8: Moran's I spatial autocorrelation
+        if st.session_state.get('moran_result'):
+            mr = st.session_state.moran_result
+            st.markdown("**Spatial Autocorrelation (Moran's I)**")
+            if 'error' not in mr:
+                mc1, mc2, mc3 = st.columns(3)
+                with mc1: st.metric("Moran's I", mr['moran_i'])
+                with mc2: st.metric("p-value", mr['p_value'])
+                with mc3: st.metric("Z-score", mr['z_score'])
+                st.caption(f"{mr['significance']} — {mr['interpretation']}")
+            else:
+                st.caption(f"Spatial autocorrelation unavailable: {mr['error']}")
+            st.markdown("")
+
         st.markdown("---")
         st.subheader("💡 Recommendations")
         for r in recs:
@@ -562,16 +687,20 @@ if st.session_state.maps_generated and st.session_state.final_risk_grid is not N
 
         top_n = st.slider("Hotspots to display", 5, 30, 10)
         hs = frg.nlargest(top_n, 'final_risk').to_crs("EPSG:4326").copy()
-        hs['Latitude']     = hs.centroid.y.round(5)
-        hs['Longitude']    = hs.centroid.x.round(5)
-        hs['Risk Score']   = hs['final_risk'].round(4)
-        hs['Band']         = hs['risk_band']
-        hs['Buildings']    = hs['n_buildings'].astype(int)
-        hs['Density Risk'] = hs['density_risk'].round(3)
-        hs['Access Risk']  = hs['access_risk'].round(3)
-        hs['Water Risk']   = hs['water_risk'].round(3)
+        hs['Latitude']        = hs.centroid.y.round(5)
+        hs['Longitude']       = hs.centroid.x.round(5)
+        hs['Risk Score']      = hs['final_risk'].round(4)
+        hs['Band']            = hs['risk_band']
+        hs['Buildings']       = hs['n_buildings'].astype(int)
+        hs['Density Risk']    = hs['density_risk'].round(3)
+        hs['Access Risk']     = hs['access_risk'].round(3)
+        hs['Water Risk']      = hs['water_risk'].round(3)
         _hcols = ['Latitude','Longitude','Risk Score','Band','Buildings',
                   'Density Risk','Access Risk','Water Risk']
+        # IMPROVEMENT 3: show travel time column if available
+        if 'avg_travel_time' in hs.columns:
+            hs['Travel Time (s)'] = hs['avg_travel_time'].round(1)
+            _hcols.append('Travel Time (s)')
         if 'hazard_risk' in hs.columns:
             hs['Hazard Risk'] = hs['hazard_risk'].round(3)
             _hcols.append('Hazard Risk')

@@ -21,6 +21,11 @@ matplotlib
 # Export
 simplekml
 
+# Scientific classification and spatial statistics
+jenkspy
+libpysal
+esda
+
 # API endpoint (optional)
 fastapi
 uvicorn
