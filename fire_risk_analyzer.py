@@ -554,6 +554,12 @@ def calculate_composite_risk(density_grid, buildings_with_all_risks, weights, ag
     if 'combustibility' in grid.columns:
         grid = grid.rename(columns={'combustibility': 'avg_combustibility'})
 
+    # Drop duplicate columns — can arise when density_grid already carries avg_combustibility
+    # and the join adds a second combustibility→avg_combustibility column.
+    # Keep the first occurrence (from density_grid, which is more accurate).
+    grid = grid.loc[:, ~grid.columns.duplicated(keep='first')]
+    grid = grid.reset_index(drop=True)
+
     for col in ['avg_travel_time', 'avg_distance_water']:
         if col not in grid.columns:
             grid[col] = 0
