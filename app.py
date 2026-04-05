@@ -1,5 +1,6 @@
 import streamlit as st
 from geopy.geocoders import Nominatim
+import streamlit.components.v1 as components
 from streamlit_folium import st_folium as _st_folium
 import geopandas as gpd
 from shapely.geometry import Point
@@ -647,36 +648,37 @@ if st.session_state.maps_generated and st.session_state.final_risk_grid is not N
     # ── TAB 3: Interactive map ─────────────────────────────────────────────────
     with tab_interactive:
         st.subheader("Interactive Fire Risk Map")
-        st.caption("Use the **⊞ layers icon** (top-right of map) to toggle: Street Map · Satellite · Risk Grid · Heatmap · Road Risk · Fire Stations · Water Sources · Distance Rings")
+        st.caption("Click the **layers icon ⊞** (top-right of map) to toggle layers on/off.")
 
-        if st.session_state.folium_map is not None:
-            # Render natively — layer control works correctly here
-            map_data = _st_folium(
-                st.session_state.folium_map,
-                use_container_width=True,
-                height=560,
-                returned_objects=["last_clicked"],
-            )
+        if os.path.exists('interactive_risk_map.html'):
+            # Load and display the saved HTML map — always renders correctly
+            with open('interactive_risk_map.html', 'r', encoding='utf-8') as _f:
+                _map_html = _f.read()
+            components.html(_map_html, height=580, scrolling=False)
 
-            # Click-to-place feedback
-            if map_data and map_data.get("last_clicked"):
-                _cl = map_data["last_clicked"]
-                st.success(
-                    f"📌 Clicked: **lat={_cl['lat']:.5f}, lon={_cl['lng']:.5f}** "
-                    f"— paste into sidebar → Advanced Options → Hypothetical Station"
+            # Download button
+            with open('interactive_risk_map.html', 'rb') as _ff:
+                st.download_button(
+                    "🔲 Download Map for Fullscreen View",
+                    data=_ff.read(),
+                    file_name="fire_risk_interactive_map.html",
+                    mime="text/html",
                 )
-            else:
-                st.caption("📍 Click anywhere on the map to capture coordinates for a hypothetical fire station.")
 
-            # Download the saved HTML for fullscreen use
-            if os.path.exists('interactive_risk_map.html'):
-                with open('interactive_risk_map.html', 'rb') as _ff:
-                    st.download_button(
-                        "🔲 Download Map for Fullscreen View",
-                        data=_ff.read(),
-                        file_name="fire_risk_interactive_map.html",
-                        mime="text/html",
-                    )
+            # Click-to-place: small dedicated st_folium map
+            st.markdown("---")
+            st.markdown("**📍 Click-to-Place — Get Coordinates for a Hypothetical Station**")
+            st.caption("Click a spot below, then paste the coordinates into sidebar → Advanced Options.")
+            import folium as _fl
+            _gw = frg.to_crs("EPSG:4326")
+            _ctr = [_gw.centroid.y.mean(), _gw.centroid.x.mean()]
+            _click_map = _fl.Map(location=_ctr, zoom_start=15, tiles="CartoDB positron")
+            _fl.Marker(_ctr, tooltip="Area centre").add_to(_click_map)
+            _md = _st_folium(_click_map, height=300, use_container_width=True,
+                             returned_objects=["last_clicked"], key="click_place_map")
+            if _md and _md.get("last_clicked"):
+                _cl = _md["last_clicked"]
+                st.success(f"📌 lat={_cl['lat']:.5f}, lon={_cl['lng']:.5f}")
         else:
             st.info("Run an analysis to generate the interactive map.")
 
