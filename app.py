@@ -654,7 +654,7 @@ if st.session_state.maps_generated and st.session_state.final_risk_grid is not N
             # Load and display the saved HTML map — always renders correctly
             with open('interactive_risk_map.html', 'r', encoding='utf-8') as _f:
                 _map_html = _f.read()
-            components.html(_map_html, height=580, scrolling=False)
+            components.html(_map_html, height=580, scrolling=True)
 
             # Download button
             with open('interactive_risk_map.html', 'rb') as _ff:

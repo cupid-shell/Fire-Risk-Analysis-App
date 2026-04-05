@@ -860,9 +860,25 @@ def generate_interactive_risk_map(grid, fire_stations_proj=None, water_sources_p
             print(f"Road overlay skipped: {e}")
 
     m.add_child(colormap)
-    folium.LayerControl(collapsed=False, position='topright').add_to(m)
+    # bottomleft avoids right-edge clipping inside Streamlit's iframe
+    folium.LayerControl(collapsed=False, position='bottomleft').add_to(m)
 
-    # Save HTML (used for the download button)
+    # Force the layer control above all other elements inside the iframe
+    m.get_root().html.add_child(folium.Element("""
+    <style>
+    .leaflet-control-layers {
+        z-index: 9999 !important;
+        background: rgba(255,255,255,0.97) !important;
+        border-radius: 6px !important;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.5) !important;
+        max-height: 85vh;
+        overflow-y: auto;
+    }
+    .leaflet-control-layers-expanded { padding: 8px 12px; min-width: 170px; font-size: 13px; }
+    .leaflet-control-layers label    { cursor: pointer; }
+    </style>
+    """))
+
     m.save('interactive_risk_map.html')
 
     # Return the map object so Streamlit can render it natively via st_folium
