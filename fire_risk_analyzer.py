@@ -542,6 +542,7 @@ def calculate_composite_risk(density_grid, buildings_with_all_risks, weights, ag
                 agg_cols.append(col)
         avg_risks_in_grid = merged.groupby('index_right')[agg_cols].mean()
         grid = grid.join(avg_risks_in_grid)
+        grid = grid.reset_index(drop=True)  # prevent duplicate-label errors from join
 
     # Rename for unified reference
     if travel_col in grid.columns:
