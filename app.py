@@ -81,6 +81,7 @@ _defaults = {
     'last_recs': [], 'folium_map': None,
     'mc_grid': None, 'moran_result': None,
     'use_ahp': False, 'ahp_w': None,
+    'last_fire_stations': None, 'last_water_sources': None, 'last_extra_station': None,
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -261,7 +262,8 @@ with st.sidebar:
                   'scenario_a', 'scenario_b', 'last_location_point',
                   'last_accessible_roads', 'last_weights', 'last_recs',
                   'last_n_buildings', 'last_n_stations', 'last_n_water', 'last_n_hazards',
-                  'mc_grid', 'moran_result', 'use_ahp', 'ahp_w']:
+                  'mc_grid', 'moran_result', 'use_ahp', 'ahp_w',
+                  'last_fire_stations', 'last_water_sources', 'last_extra_station']:
             st.session_state[k] = _defaults.get(k)
         st.rerun()
 
@@ -519,6 +521,9 @@ if analyse_clicked:
             st.session_state.last_n_water          = n_water
             st.session_state.last_n_hazards        = n_hazards
             st.session_state.last_recs             = recs
+            st.session_state.last_fire_stations    = fire_stations
+            st.session_state.last_water_sources    = water_sources
+            st.session_state.last_extra_station    = extra_station
 
             snap = {
                 'label': f"{location_query} | r={search_dist}m | D:{weights['density']:.0%} A:{weights['access']:.0%} W:{weights['water']:.0%} H:{weights['height']:.0%} Z:{weights['hazard']:.0%}",
@@ -648,39 +653,67 @@ if st.session_state.maps_generated and st.session_state.final_risk_grid is not N
     # ── TAB 3: Interactive map ─────────────────────────────────────────────────
     with tab_interactive:
         st.subheader("Interactive Fire Risk Map")
-        st.caption("Click the **layers icon ⊞** (top-right of map) to toggle layers on/off.")
 
-        if os.path.exists('interactive_risk_map.html'):
-            # Load and display the saved HTML map — always renders correctly
-            with open('interactive_risk_map.html', 'r', encoding='utf-8') as _f:
-                _map_html = _f.read()
-            components.html(_map_html, height=580, scrolling=True)
+        # ── Layer toggles (Streamlit checkboxes, outside iframe) ──────────────
+        st.markdown("**Layer Controls**")
+        _lc1, _lc2, _lc3, _lc4 = st.columns(4)
+        with _lc1:
+            _lyr_risk  = st.checkbox("Risk Grid",         value=True,  key="lyr_risk")
+            _lyr_heat  = st.checkbox("Risk Heatmap",      value=True,  key="lyr_heat")
+        with _lc2:
+            _lyr_roads = st.checkbox("Road Risk Overlay", value=True,  key="lyr_roads")
+            _lyr_sta   = st.checkbox("Fire Stations",     value=True,  key="lyr_sta")
+        with _lc3:
+            _lyr_water = st.checkbox("Water Sources",     value=True,  key="lyr_water")
+            _lyr_rings = st.checkbox("Distance Rings",    value=True,  key="lyr_rings")
+        with _lc4:
+            _lyr_sat   = st.checkbox("Satellite Base",    value=False, key="lyr_sat")
 
-            # Download button
-            with open('interactive_risk_map.html', 'rb') as _ff:
-                st.download_button(
-                    "🔲 Download Map for Fullscreen View",
-                    data=_ff.read(),
-                    file_name="fire_risk_interactive_map.html",
-                    mime="text/html",
-                )
+        _show_layers = {
+            'Risk Grid':         _lyr_risk,
+            'Risk Heatmap':      _lyr_heat,
+            'Road Risk Overlay': _lyr_roads,
+            'Fire Stations':     _lyr_sta,
+            'Water Sources':     _lyr_water,
+            'Distance Rings':    _lyr_rings,
+            'Satellite Base':    _lyr_sat,
+        }
 
-            # Click-to-place: small dedicated st_folium map
-            st.markdown("---")
-            st.markdown("**📍 Click-to-Place — Get Coordinates for a Hypothetical Station**")
-            st.caption("Click a spot below, then paste the coordinates into sidebar → Advanced Options.")
-            import folium as _fl
-            _gw = frg.to_crs("EPSG:4326")
-            _ctr = [_gw.centroid.y.mean(), _gw.centroid.x.mean()]
-            _click_map = _fl.Map(location=_ctr, zoom_start=15, tiles="CartoDB positron")
-            _fl.Marker(_ctr, tooltip="Area centre").add_to(_click_map)
-            _md = _st_folium(_click_map, height=300, use_container_width=True,
-                             returned_objects=["last_clicked"], key="click_place_map")
-            if _md and _md.get("last_clicked"):
-                _cl = _md["last_clicked"]
-                st.success(f"📌 lat={_cl['lat']:.5f}, lon={_cl['lng']:.5f}")
-        else:
-            st.info("Run an analysis to generate the interactive map.")
+        # Regenerate map with selected layers then display
+        _fs = st.session_state.get('last_fire_stations')
+        _ws = st.session_state.get('last_water_sources')
+        _es = st.session_state.get('last_extra_station')
+        _ar = st.session_state.last_accessible_roads
+
+        generate_interactive_risk_map(frg, _fs, _ws, _es, _ar, show_layers=_show_layers)
+
+        with open('interactive_risk_map.html', 'r', encoding='utf-8') as _f:
+            _map_html = _f.read()
+        components.html(_map_html, height=580, scrolling=True)
+
+        # Download button
+        with open('interactive_risk_map.html', 'rb') as _ff:
+            st.download_button(
+                "🔲 Download Map for Fullscreen View",
+                data=_ff.read(),
+                file_name="fire_risk_interactive_map.html",
+                mime="text/html",
+            )
+
+        # Click-to-place: small dedicated st_folium map
+        st.markdown("---")
+        st.markdown("**📍 Click-to-Place — Get Coordinates for a Hypothetical Station**")
+        st.caption("Click a spot below, then paste the coordinates into sidebar → Advanced Options.")
+        import folium as _fl
+        _gw = frg.to_crs("EPSG:4326")
+        _ctr = [_gw.centroid.y.mean(), _gw.centroid.x.mean()]
+        _click_map = _fl.Map(location=_ctr, zoom_start=15, tiles="CartoDB positron")
+        _fl.Marker(_ctr, tooltip="Area centre").add_to(_click_map)
+        _md = _st_folium(_click_map, height=300, use_container_width=True,
+                         returned_objects=["last_clicked"], key="click_place_map")
+        if _md and _md.get("last_clicked"):
+            _cl = _md["last_clicked"]
+            st.success(f"📌 lat={_cl['lat']:.5f}, lon={_cl['lng']:.5f}")
 
     # ── TAB 4: Hotspots ────────────────────────────────────────────────────────
     with tab_hotspots:

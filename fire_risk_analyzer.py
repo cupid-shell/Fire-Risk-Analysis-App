@@ -729,54 +729,69 @@ def generate_static_risk_map(grid, graph):
     fig.savefig('final_risk_map.png', dpi=300, bbox_inches='tight', pad_inches=0, facecolor='#060606')
     plt.close(fig)
 
-def generate_interactive_risk_map(grid, fire_stations_proj=None, water_sources_proj=None, extra_station=None, accessible_roads=None):
+def generate_interactive_risk_map(grid, fire_stations_proj=None, water_sources_proj=None, extra_station=None, accessible_roads=None, show_layers=None):
     print("Generating interactive risk map...")
+    # show_layers controls which overlays are included; defaults to all on
+    sl = show_layers or {}
+    show_risk     = sl.get('Risk Grid',              True)
+    show_heatmap  = sl.get('Risk Heatmap',           True)
+    show_roads    = sl.get('Road Risk Overlay',      True)
+    show_stations = sl.get('Fire Stations',          True)
+    show_water    = sl.get('Water Sources',          True)
+    show_rings    = sl.get('Distance Rings',         True)
+    use_satellite = sl.get('Satellite Base',         False)
+
     grid_wgs84 = grid.to_crs("EPSG:4326")
+    # Sanitise values to avoid JSON serialisation errors
+    grid_wgs84 = grid_wgs84.copy()
+    grid_wgs84['final_risk'] = grid_wgs84['final_risk'].fillna(0).clip(0, 1)
+    grid_wgs84['n_buildings'] = grid_wgs84['n_buildings'].fillna(0).astype(int)
+
     map_center = [grid_wgs84.centroid.y.mean(), grid_wgs84.centroid.x.mean()]
 
-    # tiles=None so BOTH base layers appear properly in LayerControl
-    m = folium.Map(location=map_center, zoom_start=15, tiles=None)
+    # Choose base tile based on toggle
+    base_tile = (
+        'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+        if use_satellite else 'CartoDB positron'
+    )
+    base_attr = 'Esri World Imagery' if use_satellite else '© CartoDB'
+    m = folium.Map(location=map_center, zoom_start=15, tiles=base_tile, attr=base_attr)
 
-    # Base layer 1 – Street map (default / shown first)
-    folium.TileLayer('CartoDB positron', name='Street Map', overlay=False).add_to(m)
-
-    # Base layer 2 – Satellite
-    folium.TileLayer(
-        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-        attr='Esri World Imagery',
-        name='Satellite',
-        overlay=False,
-    ).add_to(m)
-
-    colormap = cm.LinearColormap(colors=['green', 'yellow', 'red'], vmin=grid['final_risk'].min(), vmax=grid['final_risk'].max())
+    colormap = cm.LinearColormap(
+        colors=['green', 'yellow', 'red'],
+        vmin=grid_wgs84['final_risk'].min(),
+        vmax=max(grid_wgs84['final_risk'].max(), 0.01)
+    )
     colormap.caption = 'Composite Fire Risk Score'
-    tooltip_fields = ['n_buildings', 'final_risk', 'risk_band'] if 'risk_band' in grid_wgs84.columns else ['n_buildings', 'final_risk']
-    tooltip_aliases = ['Buildings:', 'Risk Score:', 'Risk Band:'] if 'risk_band' in grid_wgs84.columns else ['Buildings:', 'Risk Score:']
-    style_function = lambda x: {'fillColor': colormap(x['properties']['final_risk']), 'color': 'black', 'weight': 0.5, 'fillOpacity': 0.7}
-    risk_layer = folium.FeatureGroup(name="Risk Grid")
-    folium.GeoJson(grid_wgs84, style_function=style_function, tooltip=folium.features.GeoJsonTooltip(fields=tooltip_fields, aliases=tooltip_aliases)).add_to(risk_layer)
-    risk_layer.add_to(m)
 
-    # Water source markers
-    if water_sources_proj is not None and not water_sources_proj.empty:
-        water_layer = folium.FeatureGroup(name="Water Sources")
+    if show_risk:
+        tooltip_fields   = ['n_buildings', 'final_risk', 'risk_band'] if 'risk_band' in grid_wgs84.columns else ['n_buildings', 'final_risk']
+        tooltip_aliases  = ['Buildings:', 'Risk Score:', 'Risk Band:']  if 'risk_band' in grid_wgs84.columns else ['Buildings:', 'Risk Score:']
+        style_fn = lambda x: {'fillColor': colormap(x['properties']['final_risk']), 'color': 'black', 'weight': 0.5, 'fillOpacity': 0.7}
+        folium.GeoJson(
+            grid_wgs84,
+            style_function=style_fn,
+            tooltip=folium.features.GeoJsonTooltip(fields=tooltip_fields, aliases=tooltip_aliases)
+        ).add_to(m)
+
+    if show_heatmap:
+        heat_data = [
+            [row.geometry.centroid.y, row.geometry.centroid.x, row['final_risk']]
+            for _, row in grid_wgs84[grid_wgs84['n_buildings'] > 0].iterrows()
+        ]
+        if heat_data:
+            folium.plugins.HeatMap(heat_data, radius=20, blur=15, min_opacity=0.3).add_to(m)
+
+    if show_water and water_sources_proj is not None and not water_sources_proj.empty:
         water_wgs84 = water_sources_proj.to_crs("EPSG:4326")
         for _, row in water_wgs84.iterrows():
             pt = row.geometry.centroid
             folium.CircleMarker(
-                location=[pt.y, pt.x],
-                radius=5,
-                color='blue',
-                fill=True,
-                fill_color='#3399ff',
-                fill_opacity=0.8,
-                tooltip="Water Source"
-            ).add_to(water_layer)
-        water_layer.add_to(m)
+                location=[pt.y, pt.x], radius=5, color='blue',
+                fill=True, fill_color='#3399ff', fill_opacity=0.8, tooltip="Water Source"
+            ).add_to(m)
 
-    # Fire station markers
-    if fire_stations_proj is not None and not fire_stations_proj.empty:
-        station_layer = folium.FeatureGroup(name="Fire Stations (OSM)")
+    if show_stations and fire_stations_proj is not None and not fire_stations_proj.empty:
         stations_wgs84 = fire_stations_proj.to_crs("EPSG:4326")
         for _, row in stations_wgs84.iterrows():
             pt = row.geometry.centroid
@@ -784,192 +799,57 @@ def generate_interactive_risk_map(grid, fire_stations_proj=None, water_sources_p
                 location=[pt.y, pt.x],
                 icon=folium.Icon(color='red', icon='fire', prefix='fa'),
                 tooltip="Fire Station"
-            ).add_to(station_layer)
-        station_layer.add_to(m)
+            ).add_to(m)
 
-    # Hypothetical station marker
     if extra_station is not None:
-        hyp_layer = folium.FeatureGroup(name="Hypothetical Station")
         folium.Marker(
             location=[extra_station[0], extra_station[1]],
             icon=folium.Icon(color='orange', icon='fire', prefix='fa'),
             tooltip="Hypothetical Fire Station"
-        ).add_to(hyp_layer)
-        hyp_layer.add_to(m)
+        ).add_to(m)
 
-    # Distance rings around all stations
-    all_station_coords = []
-    if fire_stations_proj is not None and not fire_stations_proj.empty:
-        s_wgs84 = fire_stations_proj.to_crs("EPSG:4326")
-        for _, row in s_wgs84.iterrows():
-            pt = row.geometry.centroid
-            all_station_coords.append((pt.y, pt.x))
-    if extra_station is not None:
-        all_station_coords.append((extra_station[0], extra_station[1]))
-
-    if all_station_coords:
-        ring_layer = folium.FeatureGroup(name="Response Distance Rings")
+    if show_rings:
+        all_station_coords = []
+        if fire_stations_proj is not None and not fire_stations_proj.empty:
+            s_wgs84 = fire_stations_proj.to_crs("EPSG:4326")
+            for _, row in s_wgs84.iterrows():
+                all_station_coords.append((row.geometry.centroid.y, row.geometry.centroid.x))
+        if extra_station is not None:
+            all_station_coords.append((extra_station[0], extra_station[1]))
         ring_colors = {500: '#00cc44', 1000: '#ffaa00', 1500: '#ff4444'}
         for lat, lon in all_station_coords:
             for radius_m, color in ring_colors.items():
                 folium.Circle(
-                    location=[lat, lon],
-                    radius=radius_m,
-                    color=color,
-                    fill=False,
-                    weight=1.5,
-                    dash_array='6',
+                    location=[lat, lon], radius=radius_m, color=color,
+                    fill=False, weight=1.5, dash_array='6',
                     tooltip=f"{radius_m}m response zone"
-                ).add_to(ring_layer)
-        ring_layer.add_to(m)
+                ).add_to(m)
 
-    # Heatmap layer
-    heat_data = [
-        [row.geometry.centroid.y, row.geometry.centroid.x, row['final_risk']]
-        for _, row in grid_wgs84[grid_wgs84['n_buildings'] > 0].iterrows()
-    ]
-    if heat_data:
-        heatmap_layer = folium.FeatureGroup(name="Risk Heatmap (smooth)")
-        folium.plugins.HeatMap(heat_data, radius=20, blur=15, min_opacity=0.3).add_to(heatmap_layer)
-        heatmap_layer.add_to(m)
-
-    # Road risk overlay
-    if accessible_roads is not None and not accessible_roads.empty:
+    if show_roads and accessible_roads is not None and not accessible_roads.empty:
         try:
             roads_wgs84 = accessible_roads.to_crs("EPSG:4326").copy()
             grid_pts = grid_wgs84[['geometry', 'final_risk']].copy()
             grid_pts['geometry'] = grid_pts.geometry.centroid
-            road_sample = roads_wgs84.iloc[::max(1, len(roads_wgs84)//400)]  # cap at ~400 segments
+            road_sample = roads_wgs84.iloc[::max(1, len(roads_wgs84)//400)]
             road_mids = road_sample.copy()
             road_mids['geometry'] = road_mids.geometry.centroid
             joined = gpd.sjoin_nearest(road_mids[['geometry']], grid_pts, how='left')
             road_sample = road_sample.copy()
             road_sample['road_risk'] = joined['final_risk'].values
             road_cmap = cm.LinearColormap(colors=['green', 'yellow', 'red'], vmin=0, vmax=1)
-            road_layer = folium.FeatureGroup(name="Road Risk Overlay")
             for _, row in road_sample.iterrows():
                 risk = float(row.get('road_risk') or 0)
                 try:
                     coords = [(pt[1], pt[0]) for pt in row.geometry.coords]
                     folium.PolyLine(coords, color=road_cmap(risk), weight=3, opacity=0.75,
-                                   tooltip=f"Road Risk: {risk:.3f}").add_to(road_layer)
+                                   tooltip=f"Road Risk: {risk:.3f}").add_to(m)
                 except Exception:
                     pass
-            road_layer.add_to(m)
         except Exception as e:
             print(f"Road overlay skipped: {e}")
 
     m.add_child(colormap)
-    folium.LayerControl(collapsed=False, position='topright').add_to(m)
-
     m.save('interactive_risk_map.html')
-
-    # Post-process: inject JS that moves the layer control to document.body
-    # with position:fixed so it is NEVER clipped by Leaflet's overflow:hidden containers.
-    with open('interactive_risk_map.html', 'r', encoding='utf-8') as _f:
-        _html = _f.read()
-
-    _fix = """
-<style>
-#floating-layer-ctrl {
-    position: fixed;
-    top: 70px;
-    right: 12px;
-    z-index: 999999;
-    background: rgba(255,255,255,0.97);
-    border-radius: 8px;
-    padding: 10px 14px;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.45);
-    font-family: Arial, sans-serif;
-    font-size: 13px;
-    min-width: 175px;
-    max-height: 80vh;
-    overflow-y: auto;
-    cursor: default;
-}
-#floating-layer-ctrl b { display:block; margin-bottom:5px; font-size:14px; }
-#floating-layer-ctrl label { display:flex; align-items:center; gap:6px;
-    margin:3px 0; cursor:pointer; user-select:none; }
-#floating-layer-ctrl hr { border:none; border-top:1px solid #ddd; margin:6px 0; }
-#floating-layer-ctrl .section-title { font-size:11px; color:#666; margin:4px 0 2px; }
-</style>
-<script>
-window.addEventListener('load', function() {
-    // Give Leaflet time to fully render
-    setTimeout(function() {
-        var ctrl = document.querySelector('.leaflet-control-layers');
-        if (!ctrl) return;
-        // Hide the original Leaflet control
-        ctrl.style.display = 'none';
-
-        // Collect base layers and overlays from the Leaflet control's DOM
-        var baseDivs    = ctrl.querySelectorAll('.leaflet-control-layers-base input');
-        var overlayDivs = ctrl.querySelectorAll('.leaflet-control-layers-overlays input');
-        var baseLabels    = ctrl.querySelectorAll('.leaflet-control-layers-base label');
-        var overlayLabels = ctrl.querySelectorAll('.leaflet-control-layers-overlays label');
-
-        // Build floating panel
-        var panel = document.createElement('div');
-        panel.id = 'floating-layer-ctrl';
-
-        var title = document.createElement('b');
-        title.textContent = '\\u2B1E Layers';
-        panel.appendChild(title);
-
-        // Base layers section
-        if (baseDivs.length > 0) {
-            var t1 = document.createElement('div');
-            t1.className = 'section-title';
-            t1.textContent = 'Base Map';
-            panel.appendChild(t1);
-            baseDivs.forEach(function(inp, i) {
-                var lbl = document.createElement('label');
-                var radio = inp.cloneNode(true);
-                // Keep original input in sync
-                radio.addEventListener('change', function() { inp.click(); });
-                inp.addEventListener('change', function() {
-                    if (radio.type === 'radio') radio.checked = inp.checked;
-                });
-                var txt = document.createTextNode(
-                    baseLabels[i] ? baseLabels[i].textContent.trim() : 'Layer ' + i);
-                lbl.appendChild(radio);
-                lbl.appendChild(txt);
-                panel.appendChild(lbl);
-            });
-            var hr = document.createElement('hr');
-            panel.appendChild(hr);
-        }
-
-        // Overlay layers section
-        if (overlayDivs.length > 0) {
-            var t2 = document.createElement('div');
-            t2.className = 'section-title';
-            t2.textContent = 'Overlays';
-            panel.appendChild(t2);
-            overlayDivs.forEach(function(inp, i) {
-                var lbl = document.createElement('label');
-                var chk = inp.cloneNode(true);
-                chk.addEventListener('change', function() { inp.click(); });
-                inp.addEventListener('change', function() { chk.checked = inp.checked; });
-                var txt = document.createTextNode(
-                    overlayLabels[i] ? overlayLabels[i].textContent.trim() : 'Layer ' + i);
-                lbl.appendChild(chk);
-                lbl.appendChild(txt);
-                panel.appendChild(lbl);
-            });
-        }
-
-        document.body.appendChild(panel);
-    }, 800);
-});
-</script>
-"""
-    # Insert before </body>
-    _html = _html.replace('</body>', _fix + '\n</body>')
-    with open('interactive_risk_map.html', 'w', encoding='utf-8') as _f:
-        _f.write(_html)
-
-    # Return the map object so Streamlit can render it natively via st_folium
     return m
 
 def main(place_name, location_point, search_distance, weights, road_types=None, extra_station=None, wind_direction=None):
