@@ -860,26 +860,114 @@ def generate_interactive_risk_map(grid, fire_stations_proj=None, water_sources_p
             print(f"Road overlay skipped: {e}")
 
     m.add_child(colormap)
-    # bottomleft avoids right-edge clipping inside Streamlit's iframe
-    folium.LayerControl(collapsed=False, position='bottomleft').add_to(m)
-
-    # Force the layer control above all other elements inside the iframe
-    m.get_root().html.add_child(folium.Element("""
-    <style>
-    .leaflet-control-layers {
-        z-index: 9999 !important;
-        background: rgba(255,255,255,0.97) !important;
-        border-radius: 6px !important;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.5) !important;
-        max-height: 85vh;
-        overflow-y: auto;
-    }
-    .leaflet-control-layers-expanded { padding: 8px 12px; min-width: 170px; font-size: 13px; }
-    .leaflet-control-layers label    { cursor: pointer; }
-    </style>
-    """))
+    folium.LayerControl(collapsed=False, position='topright').add_to(m)
 
     m.save('interactive_risk_map.html')
+
+    # Post-process: inject JS that moves the layer control to document.body
+    # with position:fixed so it is NEVER clipped by Leaflet's overflow:hidden containers.
+    with open('interactive_risk_map.html', 'r', encoding='utf-8') as _f:
+        _html = _f.read()
+
+    _fix = """
+<style>
+#floating-layer-ctrl {
+    position: fixed;
+    top: 70px;
+    right: 12px;
+    z-index: 999999;
+    background: rgba(255,255,255,0.97);
+    border-radius: 8px;
+    padding: 10px 14px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.45);
+    font-family: Arial, sans-serif;
+    font-size: 13px;
+    min-width: 175px;
+    max-height: 80vh;
+    overflow-y: auto;
+    cursor: default;
+}
+#floating-layer-ctrl b { display:block; margin-bottom:5px; font-size:14px; }
+#floating-layer-ctrl label { display:flex; align-items:center; gap:6px;
+    margin:3px 0; cursor:pointer; user-select:none; }
+#floating-layer-ctrl hr { border:none; border-top:1px solid #ddd; margin:6px 0; }
+#floating-layer-ctrl .section-title { font-size:11px; color:#666; margin:4px 0 2px; }
+</style>
+<script>
+window.addEventListener('load', function() {
+    // Give Leaflet time to fully render
+    setTimeout(function() {
+        var ctrl = document.querySelector('.leaflet-control-layers');
+        if (!ctrl) return;
+        // Hide the original Leaflet control
+        ctrl.style.display = 'none';
+
+        // Collect base layers and overlays from the Leaflet control's DOM
+        var baseDivs    = ctrl.querySelectorAll('.leaflet-control-layers-base input');
+        var overlayDivs = ctrl.querySelectorAll('.leaflet-control-layers-overlays input');
+        var baseLabels    = ctrl.querySelectorAll('.leaflet-control-layers-base label');
+        var overlayLabels = ctrl.querySelectorAll('.leaflet-control-layers-overlays label');
+
+        // Build floating panel
+        var panel = document.createElement('div');
+        panel.id = 'floating-layer-ctrl';
+
+        var title = document.createElement('b');
+        title.textContent = '\\u2B1E Layers';
+        panel.appendChild(title);
+
+        // Base layers section
+        if (baseDivs.length > 0) {
+            var t1 = document.createElement('div');
+            t1.className = 'section-title';
+            t1.textContent = 'Base Map';
+            panel.appendChild(t1);
+            baseDivs.forEach(function(inp, i) {
+                var lbl = document.createElement('label');
+                var radio = inp.cloneNode(true);
+                // Keep original input in sync
+                radio.addEventListener('change', function() { inp.click(); });
+                inp.addEventListener('change', function() {
+                    if (radio.type === 'radio') radio.checked = inp.checked;
+                });
+                var txt = document.createTextNode(
+                    baseLabels[i] ? baseLabels[i].textContent.trim() : 'Layer ' + i);
+                lbl.appendChild(radio);
+                lbl.appendChild(txt);
+                panel.appendChild(lbl);
+            });
+            var hr = document.createElement('hr');
+            panel.appendChild(hr);
+        }
+
+        // Overlay layers section
+        if (overlayDivs.length > 0) {
+            var t2 = document.createElement('div');
+            t2.className = 'section-title';
+            t2.textContent = 'Overlays';
+            panel.appendChild(t2);
+            overlayDivs.forEach(function(inp, i) {
+                var lbl = document.createElement('label');
+                var chk = inp.cloneNode(true);
+                chk.addEventListener('change', function() { inp.click(); });
+                inp.addEventListener('change', function() { chk.checked = inp.checked; });
+                var txt = document.createTextNode(
+                    overlayLabels[i] ? overlayLabels[i].textContent.trim() : 'Layer ' + i);
+                lbl.appendChild(chk);
+                lbl.appendChild(txt);
+                panel.appendChild(lbl);
+            });
+        }
+
+        document.body.appendChild(panel);
+    }, 800);
+});
+</script>
+"""
+    # Insert before </body>
+    _html = _html.replace('</body>', _fix + '\n</body>')
+    with open('interactive_risk_map.html', 'w', encoding='utf-8') as _f:
+        _f.write(_html)
 
     # Return the map object so Streamlit can render it natively via st_folium
     return m
