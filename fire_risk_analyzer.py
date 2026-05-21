@@ -64,52 +64,145 @@ def ahp_weights(pairwise_matrix):
     return dict(zip(factor_names, weights)), CR
 
 
+def fetch_all_osm_parallel(location_point, distance, road_types_tuple, target_epsg):
+    """
+    Fetches road network, buildings, water, fire stations, and hazards all in parallel.
+    Avoids duplicate API fetches and speeds up processing significantly.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    ox.settings.requests_timeout = 180
+
+    def _graph():
+        try:
+            g = ox.graph_from_point(location_point, dist=distance, network_type='all')
+            # Add travel time attributes before projecting
+            g = ox.add_edge_speeds(g)
+            g = ox.add_edge_travel_times(g)
+            gp = ox.project_graph(g, to_crs=target_epsg)
+            edges = ox.graph_to_gdfs(gp, nodes=False)
+            ar = edges[edges['highway'].isin(list(road_types_tuple))]
+            return gp, ar
+        except Exception as e:
+            print(f"Graph error: {e}")
+            return None, None
+
+    def _buildings():
+        try:
+            b = ox.features_from_point(location_point, {"building": True}, dist=distance)
+            return b.to_crs(target_epsg)
+        except Exception:
+            return gpd.GeoDataFrame(columns=['geometry'], crs=target_epsg)
+
+    def _water():
+        try:
+            w = ox.features_from_point(location_point,
+                {"natural": "water", "amenity": "fire_hydrant"}, dist=distance)
+            return w.to_crs(target_epsg)
+        except Exception:
+            return gpd.GeoDataFrame(columns=['geometry'], crs=target_epsg)
+
+    def _stations():
+        try:
+            s = ox.features_from_point(location_point, {"amenity": "fire_station"}, dist=distance)
+            return s.to_crs(target_epsg)
+        except Exception:
+            return gpd.GeoDataFrame(columns=['geometry'], crs=target_epsg)
+
+    def _hazards():
+        try:
+            h = ox.features_from_point(location_point,
+                {"amenity": ["fuel", "hospital", "school", "marketplace"]}, dist=distance)
+            return h.to_crs(target_epsg)
+        except Exception:
+            return gpd.GeoDataFrame(columns=['geometry'], crs=target_epsg)
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        fg = ex.submit(_graph)
+        fb = ex.submit(_buildings)
+        fw = ex.submit(_water)
+        fs = ex.submit(_stations)
+        fh = ex.submit(_hazards)
+        
+        graph_proj, accessible_roads = fg.result()
+        buildings = fb.result()
+        water = fw.result()
+        stations = fs.result()
+        hazards = fh.result()
+
+    return graph_proj, accessible_roads, buildings, water, stations, hazards
+
+
+def calculate_network_vulnerability(grid, graph_proj):
+    """
+    Computes street network vulnerability per grid cell.
+    Dead-end ratio = dead-end nodes / total nodes in cell.
+    Cells close to dead-ends (< 100m) receive a vulnerability boost.
+    High vulnerability indicates poor egress / potential evacuation bottlenecks.
+    """
+    grid = grid.copy()
+    grid['network_vulnerability'] = 0.0
+    
+    if graph_proj is None:
+        return grid
+        
+    try:
+        undir_g = graph_proj.to_undirected()
+        nodes_df = ox.graph_to_gdfs(graph_proj, edges=False).copy()
+        
+        degrees = dict(undir_g.degree())
+        nodes_df['degree'] = nodes_df.index.map(degrees)
+        
+        dead_ends = nodes_df[nodes_df['degree'] == 1]
+        
+        grid_geom = grid[['geometry']].copy()
+        
+        if not dead_ends.empty:
+            joined_de = gpd.sjoin(dead_ends, grid_geom, how='inner', predicate='within')
+            de_counts = joined_de.groupby('index_right').size()
+        else:
+            de_counts = pd.Series(dtype=int)
+            
+        if not nodes_df.empty:
+            joined_all = gpd.sjoin(nodes_df, grid_geom, how='inner', predicate='within')
+            all_counts = joined_all.groupby('index_right').size()
+        else:
+            all_counts = pd.Series(dtype=int)
+            
+        grid['n_dead_ends'] = grid.index.map(de_counts).fillna(0)
+        grid['n_nodes'] = grid.index.map(all_counts).fillna(0)
+        
+        grid['network_vulnerability'] = np.where(
+            grid['n_nodes'] > 0,
+            grid['n_dead_ends'] / grid['n_nodes'],
+            0.0
+        )
+        
+        # Boost vulnerability for cells near dead ends
+        if not dead_ends.empty:
+            combined_de = dead_ends.union_all()
+            grid['dist_to_dead_end'] = grid.geometry.apply(lambda geom: geom.distance(combined_de))
+            near_de_boost = (1.0 - _clip_norm(grid['dist_to_dead_end'], 0, 100)) * 0.3
+            grid['network_vulnerability'] = (grid['network_vulnerability'] + near_de_boost).clip(0, 1)
+            
+    except Exception as e:
+        print(f"Network vulnerability calculation skipped: {e}")
+        
+    return grid
+
+
 def get_geospatial_data(location_point, distance, target_crs, road_types=None):
     """
-    Downloads and projects all necessary data, handling cases where features are not found.
+    Downloads and projects all necessary data in parallel, returning hazards as well.
     """
     if road_types is None:
         road_types = DEFAULT_ROAD_TYPES
 
     print(f"Fetching data within {distance}m of {location_point}...")
-    try:
-        graph = ox.graph_from_point(location_point, dist=distance, network_type='all')
-        # IMPROVEMENT 3: add travel time attributes
-        graph = ox.add_edge_speeds(graph)
-        graph = ox.add_edge_travel_times(graph)
-        graph_proj = ox.project_graph(graph, to_crs=target_crs)
-        edges = ox.graph_to_gdfs(graph_proj, nodes=False)
-        accessible_roads = edges[edges['highway'].isin(road_types)]
-    except Exception as e:
-        print(f"Could not download road network. Error: {e}")
-        return [None] * 5
-
-    try:
-        tags = {"building": True}
-        buildings = ox.features_from_point(location_point, tags, dist=distance)
-        buildings_proj = buildings.to_crs(target_crs)
-    except Exception:
-        print("Warning: No buildings found in the area. Creating empty buildings dataset.")
-        buildings_proj = gpd.GeoDataFrame(columns=['geometry'], crs=target_crs)
-
-    try:
-        water_tags = {"natural": "water", "amenity": "fire_hydrant"}
-        water_sources = ox.features_from_point(location_point, water_tags, dist=distance)
-        water_sources_proj = water_sources.to_crs(target_crs)
-    except Exception:
-        print("Warning: No water sources found in the area. Creating empty water sources dataset.")
-        water_sources_proj = gpd.GeoDataFrame(columns=['geometry'], crs=target_crs)
-
-    try:
-        station_tags = {"amenity": "fire_station"}
-        fire_stations = ox.features_from_point(location_point, station_tags, dist=distance)
-        fire_stations_proj = fire_stations.to_crs(target_crs)
-    except Exception:
-        print("Warning: No fire stations found in the area. Creating empty fire stations dataset.")
-        fire_stations_proj = gpd.GeoDataFrame(columns=['geometry'], crs=target_crs)
-
+    graph, accessible_roads, buildings, water, stations, hazards = fetch_all_osm_parallel(
+        location_point, distance, tuple(road_types), target_crs
+    )
     print("Data fetching complete!")
-    return graph_proj, buildings_proj, accessible_roads, water_sources_proj, fire_stations_proj
+    return graph, buildings, accessible_roads, water, stations, hazards
 
 
 # ── IMPROVEMENT 4: GFA + Building material combustibility ─────────────────────
@@ -591,6 +684,10 @@ def calculate_composite_risk(density_grid, buildings_with_all_risks, weights, ag
         lane_penalty = _clip_norm(1.0 / grid['avg_lanes'].clip(lower=0.5), 0, 2)
         grid['access_risk'] = (grid['access_risk'] * (1 + lane_penalty * 0.3)).clip(0, 1)
 
+    # Road network vulnerability modifier — dead-ends boost access risk by up to 20%
+    if 'network_vulnerability' in grid.columns:
+        grid['access_risk'] = (grid['access_risk'] * (1 + grid['network_vulnerability'] * 0.2)).clip(0, 1)
+
     # Water risk — use absolute threshold (ISO/TR 13387: 500m)
     grid['water_risk'] = _clip_norm(grid['avg_distance_water'], 0, WATER_MAX_M)
 
@@ -852,29 +949,138 @@ def generate_interactive_risk_map(grid, fire_stations_proj=None, water_sources_p
     m.save('interactive_risk_map.html')
     return m
 
-def main(place_name, location_point, search_distance, weights, road_types=None, extra_station=None, wind_direction=None):
-    """Orchestrates the entire analysis and map generation. Returns the final risk grid."""
+def run_analysis_pipeline(
+    location_point,
+    search_distance,
+    weights,
+    road_types=None,
+    extra_station=None,
+    wind_direction=None,
+    aggregation_method='weighted_sum',
+    run_uncertainty=False,
+    generate_maps=False,
+    # Optional pre-fetched datasets to allow caching in streamlit
+    graph=None,
+    accessible_roads=None,
+    buildings=None,
+    water_sources=None,
+    fire_stations=None,
+    hazards=None,
+):
+    """
+    Unified entry point for fire risk analysis. Runs all analysis steps,
+    spatial autocorrelation, and Monte Carlo simulation if requested.
+    Returns a dictionary of analysis outputs.
+    """
+    # 1. Estimate UTM CRS
     gdf_wgs84 = gpd.GeoDataFrame(geometry=[Point(location_point[1], location_point[0])], crs="EPSG:4326")
-    target_crs = gdf_wgs84.estimate_utm_crs()
-    graph, buildings, accessible_roads, water_sources, fire_stations = get_geospatial_data(location_point, search_distance, target_crs, road_types)
+    target_crs = gdf_wgs84.estimate_utm_crs().to_epsg()
+    
+    if road_types is None:
+        road_types = DEFAULT_ROAD_TYPES
+
+    # 2. Fetch data if not pre-provided
+    if any(x is None for x in [graph, accessible_roads, buildings, water_sources, fire_stations, hazards]):
+        graph, accessible_roads, buildings, water_sources, fire_stations, hazards = fetch_all_osm_parallel(
+            location_point, search_distance, tuple(road_types), target_crs
+        )
+
     if graph is None or buildings.empty:
         raise ValueError("No buildings or road network found. Cannot generate analysis.")
+
+    n_buildings = len(buildings)
+    n_stations = len(fire_stations) if not fire_stations.empty else 0
+    n_water = len(water_sources) if not water_sources.empty else 0
+    n_hazards = len(hazards) if not hazards.empty else 0
+
+    # 3. Calculate intermediate risk factors on buildings
     buildings_with_heights = calculate_height_risk(buildings)
     buildings_with_comb = calculate_combustibility(buildings_with_heights)
     buildings_with_occ = calculate_occupancy_modifier(buildings_with_comb)
-    density_grid = calculate_density_grid(buildings_with_occ)
-    density_grid = assess_data_completeness(buildings_with_occ, density_grid)
+    
+    # 4. Access risk factors (travel time)
     buildings_with_travel_risk = calculate_travel_risk(buildings_with_occ, fire_stations, graph, extra_station)
     buildings_with_water = calculate_water_risk(buildings_with_travel_risk, water_sources)
-    buildings_with_all_risks = calculate_hazard_risk(buildings_with_water, None)
+    buildings_with_all_risks = calculate_hazard_risk(buildings_with_water, hazards)
+
+    # 5. Density and street modifiers
+    density_grid = calculate_density_grid(buildings_with_occ)
+    density_grid = assess_data_completeness(buildings_with_occ, density_grid)
     density_grid = calculate_road_width_modifier(density_grid, accessible_roads)
-    final_risk_grid = calculate_composite_risk(density_grid, buildings_with_all_risks, weights)
+    density_grid = calculate_network_vulnerability(density_grid, graph)
+
+    # 6. Composite risk
+    final_risk_grid = calculate_composite_risk(
+        density_grid, buildings_with_all_risks, weights, aggregation=aggregation_method
+    )
+    
+    # 7. Apply wind direction
     final_risk_grid = apply_wind_modifier(final_risk_grid, wind_direction)
-    save_footprints_map(buildings, graph, 'building_footprints.png')
-    save_roads_map(accessible_roads, graph, 'road_network.png')
-    generate_static_risk_map(final_risk_grid, graph)
-    generate_interactive_risk_map(final_risk_grid, fire_stations, water_sources, extra_station, accessible_roads)
-    return final_risk_grid
+
+    # 8. Monte Carlo Uncertainty (optional)
+    mc_grid = None
+    if run_uncertainty:
+        mc_grid = monte_carlo_uncertainty(density_grid, buildings_with_all_risks, weights)
+
+    # 9. Spatial Autocorrelation (Moran's I)
+    moran_result = calculate_spatial_autocorrelation(final_risk_grid)
+
+    if generate_maps:
+        save_footprints_map(buildings, graph, 'building_footprints.png')
+        save_roads_map(accessible_roads, graph, 'road_network.png')
+        generate_static_risk_map(final_risk_grid, graph)
+        generate_interactive_risk_map(
+            final_risk_grid, fire_stations, water_sources, extra_station, accessible_roads
+        )
+
+    # Build recommendations list
+    bc = final_risk_grid['risk_band'].value_counts()
+    _avg = final_risk_grid['final_risk'].mean()
+    _crit = int(bc.get('Critical', 0))
+    _high = int(bc.get('High', 0))
+    _max = final_risk_grid['final_risk'].max()
+    recs = []
+    if _crit > 0:
+        recs.append(f"⛔ **{_crit} Critical zone(s) detected.** Prioritise fire safety inspections and ensure emergency access routes are clear.")
+    if _high > 0:
+        recs.append(f"🔴 **{_high} High-risk zone(s) found.** Consider deploying additional fire hydrants or temporary water tanks.")
+    if _avg > 0.5:
+        recs.append("📍 **Overall average risk is high.** This area may benefit from a new fire station or major infrastructure review.")
+    if _max >= 0.75:
+        c1 = final_risk_grid.nlargest(1, 'final_risk').to_crs("EPSG:4326")
+        recs.append(f"🗺 **Highest-risk cell at ({c1.centroid.y.values[0]:.4f}, {c1.centroid.x.values[0]:.4f}).** Field verification recommended.")
+    if 'access_risk' in final_risk_grid.columns and final_risk_grid['access_risk'].mean() > 0.6:
+        recs.append("🚒 **Fire station access risk is high.** Road improvements or an additional station would significantly reduce response times.")
+    if 'water_risk' in final_risk_grid.columns and final_risk_grid['water_risk'].mean() > 0.6:
+        recs.append("💧 **Water source proximity is low.** Installing more hydrants or ensuring water access could reduce suppression difficulty.")
+    if not recs:
+        recs.append("✅ Risk profile is within acceptable ranges. Continue routine monitoring.")
+
+    return {
+        "final_risk_grid": final_risk_grid,
+        "n_buildings": n_buildings,
+        "n_stations": n_stations,
+        "n_water": n_water,
+        "n_hazards": n_hazards,
+        "mc_grid": mc_grid,
+        "moran_result": moran_result,
+        "recs": recs,
+        "fire_stations": fire_stations,
+        "water_sources": water_sources,
+        "hazards": hazards,
+        "accessible_roads": accessible_roads,
+        "graph": graph,
+    }
+
+
+def main(place_name, location_point, search_distance, weights, road_types=None, extra_station=None, wind_direction=None):
+    """Orchestrates the entire analysis and map generation. Returns the final risk grid."""
+    res = run_analysis_pipeline(
+        location_point, search_distance, weights,
+        road_types=road_types, extra_station=extra_station,
+        wind_direction=wind_direction, generate_maps=True
+    )
+    return res["final_risk_grid"]
 
 if __name__ == "__main__":
     test_place = "Korail, Dhaka"

@@ -5,21 +5,12 @@ Docs at:   http://localhost:8000/docs
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 import geopandas as gpd
 from shapely.geometry import Point
 
 from fire_risk_analyzer import (
-    get_geospatial_data,
-    calculate_density_grid,
-    calculate_height_risk,
-    calculate_occupancy_modifier,
-    calculate_hazard_risk,
-    calculate_travel_risk,
-    calculate_water_risk,
-    calculate_composite_risk,
-    calculate_road_width_modifier,
-    apply_wind_modifier,
+    run_analysis_pipeline,
     DEFAULT_ROAD_TYPES,
 )
 
@@ -39,6 +30,9 @@ class AnalysisRequest(BaseModel):
     height_weight:   float = Field(0.10, ge=0, le=1)
     hazard_weight:   float = Field(0.15, ge=0, le=1)
     wind_direction:  Optional[float] = Field(None, description="Wind direction in degrees FROM (0=N, 90=E)")
+    road_types:      Optional[List[str]] = Field(None, description="List of road types to include")
+    aggregation_method: Optional[str] = Field("weighted_sum", description="weighted_sum or geometric_mean")
+    run_uncertainty: Optional[bool] = Field(False, description="Run Monte Carlo uncertainty analysis")
 
 class ZoneSummary(BaseModel):
     lat:        float
@@ -53,11 +47,19 @@ class AnalysisResponse(BaseModel):
     n_buildings:  int
     n_stations:   int
     n_water:      int
+    n_hazards:    int
     critical_zones: int
     high_zones:   int
     medium_zones: int
     low_zones:    int
-    top_5_hotspots: list[ZoneSummary]
+    data_completeness_warning: bool
+    moran_i:      Optional[float] = None
+    moran_p_value: Optional[float] = None
+    moran_significance: Optional[str] = None
+    uncertainty_mean_risk: Optional[float] = None
+    uncertainty_avg_std: Optional[float] = None
+    recommendations: List[str]
+    top_5_hotspots: List[ZoneSummary]
 
 @app.get("/", summary="Health check")
 def root():
@@ -67,9 +69,8 @@ def root():
 def analyze(req: AnalysisRequest):
     try:
         location_point = (req.latitude, req.longitude)
-        gdf = gpd.GeoDataFrame(geometry=[Point(req.longitude, req.latitude)], crs="EPSG:4326")
-        target_crs = gdf.estimate_utm_crs()
 
+        # Build weights dict
         weights = {
             "density": req.density_weight, "access": req.access_weight,
             "water":   req.water_weight,   "height": req.height_weight,
@@ -78,46 +79,61 @@ def analyze(req: AnalysisRequest):
         total = sum(weights.values())
         if total > 0:
             weights = {k: v / total for k, v in weights.items()}
+        else:
+            raise HTTPException(status_code=400, detail="All weights are zero — cannot run analysis.")
 
-        graph, buildings, accessible_roads, water_sources, fire_stations = get_geospatial_data(
-            location_point, req.radius_m, target_crs, DEFAULT_ROAD_TYPES
+        road_types = req.road_types if req.road_types else DEFAULT_ROAD_TYPES
+        agg_method = req.aggregation_method if req.aggregation_method else "weighted_sum"
+
+        # Execute unified pipeline
+        res = run_analysis_pipeline(
+            location_point=location_point,
+            search_distance=req.radius_m,
+            weights=weights,
+            road_types=road_types,
+            wind_direction=req.wind_direction,
+            aggregation_method=agg_method,
+            run_uncertainty=req.run_uncertainty or False,
+            generate_maps=False
         )
-        if graph is None or buildings.empty:
-            raise HTTPException(status_code=404, detail="No buildings or road network found at this location.")
 
-        # Fetch hazards separately
-        try:
-            import osmnx as ox
-            hz = ox.features_from_point(location_point,
-                {"amenity": ["fuel", "hospital", "school"]}, dist=req.radius_m)
-            hazards = hz.to_crs(target_crs)
-        except Exception:
-            hazards = gpd.GeoDataFrame(columns=['geometry'], crs=target_crs)
-
-        density_grid = calculate_density_grid(buildings)
-        density_grid = calculate_road_width_modifier(density_grid, accessible_roads)
-        bh  = calculate_height_risk(buildings)
-        bho = calculate_occupancy_modifier(bh)
-        bt  = calculate_travel_risk(bho, fire_stations, graph)
-        bw  = calculate_water_risk(bt, water_sources)
-        ba  = calculate_hazard_risk(bw, hazards)
-        frg = calculate_composite_risk(density_grid, ba, weights)
-        if req.wind_direction is not None:
-            frg = apply_wind_modifier(frg, req.wind_direction)
+        frg = res["final_risk_grid"]
+        mc_grid = res["mc_grid"]
+        moran_res = res["moran_result"]
 
         bc = frg['risk_band'].value_counts()
         top5 = frg.nlargest(5, 'final_risk').to_crs("EPSG:4326")
 
+        # Determine completeness warning
+        completeness_warning = bool((frg['completeness_score'] < 0.5).any()) if 'completeness_score' in frg.columns else False
+
+        # Extract Moran's I details
+        m_i = moran_res.get('moran_i') if moran_res and 'error' not in moran_res else None
+        m_p = moran_res.get('p_value') if moran_res and 'error' not in moran_res else None
+        m_sig = moran_res.get('significance') if moran_res and 'error' not in moran_res else None
+
+        # Extract MC details
+        mc_mean = float(mc_grid['risk_mean'].mean()) if mc_grid is not None else None
+        mc_std = float(mc_grid['risk_std'].mean()) if mc_grid is not None else None
+
         return AnalysisResponse(
             avg_risk=round(float(frg['final_risk'].mean()), 4),
             max_risk=round(float(frg['final_risk'].max()),  4),
-            n_buildings=len(buildings),
-            n_stations=len(fire_stations) if not fire_stations.empty else 0,
-            n_water=len(water_sources)   if not water_sources.empty  else 0,
+            n_buildings=res["n_buildings"],
+            n_stations=res["n_stations"],
+            n_water=res["n_water"],
+            n_hazards=res["n_hazards"],
             critical_zones=int(bc.get('Critical', 0)),
             high_zones=int(bc.get('High',     0)),
             medium_zones=int(bc.get('Medium',   0)),
             low_zones=int(bc.get('Low',      0)),
+            data_completeness_warning=completeness_warning,
+            moran_i=m_i,
+            moran_p_value=m_p,
+            moran_significance=m_sig,
+            uncertainty_mean_risk=mc_mean,
+            uncertainty_avg_std=mc_std,
+            recommendations=res["recs"],
             top_5_hotspots=[
                 ZoneSummary(
                     lat=round(float(row.geometry.centroid.y), 5),

@@ -9,6 +9,7 @@ import json, os, io, zipfile, datetime
 from concurrent.futures import ThreadPoolExecutor
 
 from fire_risk_analyzer import (
+    run_analysis_pipeline,
     calculate_density_grid,
     calculate_height_risk,
     calculate_occupancy_modifier,
@@ -44,32 +45,136 @@ st.set_page_config(
 )
 
 # ── Custom CSS ─────────────────────────────────────────────────────────────────
-st.markdown("""
+st.html("""
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
-/* Tighten sidebar padding */
-section[data-testid="stSidebar"] > div { padding-top: 1rem; }
-/* Metric card tweaks */
+/* Font overrides - Apply to main text tags safely */
+html, body, .stApp, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6, .stApp p, .stApp label, .stApp li {
+    font-family: 'Outfit', 'Inter', sans-serif !important;
+}
+
+/* Fallback for input controls, buttons and select elements without breaking icon fonts */
+.stApp button, .stApp select, .stApp input, .stApp textarea {
+    font-family: 'Outfit', 'Inter', sans-serif;
+}
+
+/* Tighten sidebar padding & styling */
+section[data-testid="stSidebar"] > div { 
+    padding-top: 1.5rem; 
+}
+section[data-testid="stSidebar"] {
+    background: rgba(13, 17, 23, 0.95) !important;
+    border-right: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* Prevent multiselect tags from being cut off and style them cleanly */
+div[data-baseweb="tag"] {
+    height: auto !important;
+    padding-top: 3px !important;
+    padding-bottom: 3px !important;
+    padding-left: 8px !important;
+    padding-right: 8px !important;
+    line-height: 1.3 !important;
+    font-size: 0.8rem !important;
+}
+
+/* Glassmorphic Metric Cards */
 div[data-testid="metric-container"] {
-    background: #1e1e2e;
-    border: 1px solid #333;
-    border-radius: 8px;
-    padding: 10px 14px;
+    background: rgba(22, 28, 38, 0.6) !important;
+    border: 1px solid rgba(255, 255, 255, 0.06) !important;
+    border-radius: 14px !important;
+    padding: 16px 20px !important;
+    box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+    backdrop-filter: blur(8px);
+    transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
 }
-/* Tab font size */
-button[data-baseweb="tab"] { font-size: 0.9rem; }
-/* Welcome card */
+div[data-testid="metric-container"]:hover {
+    transform: translateY(-3px);
+    border-color: rgba(255, 75, 75, 0.25) !important;
+    box-shadow: 0 12px 30px rgba(255, 75, 75, 0.12);
+}
+
+/* Sleek Tab Styles */
+button[data-baseweb="tab"] { 
+    font-family: 'Outfit', sans-serif !important;
+    font-size: 0.95rem !important;
+    font-weight: 500 !important;
+    color: #8892b0 !important;
+    border-bottom: 2px solid transparent !important;
+    padding: 12px 18px !important;
+    transition: all 0.2s ease;
+}
+button[data-baseweb="tab"][aria-selected="true"] {
+    color: #ff4b4b !important;
+    border-bottom: 2px solid #ff4b4b !important;
+    font-weight: 600 !important;
+}
+
+/* Premium Welcome Card */
 .welcome-card {
-    background: linear-gradient(135deg, #1e1e2e 0%, #2a1a2e 100%);
-    border: 1px solid #ff4444;
-    border-radius: 12px;
-    padding: 32px 40px;
+    background: linear-gradient(135deg, rgba(20, 24, 33, 0.85) 0%, rgba(35, 20, 30, 0.85) 100%) !important;
+    border: 1px solid rgba(255, 75, 75, 0.15) !important;
+    border-radius: 18px !important;
+    padding: 50px 40px !important;
     text-align: center;
-    margin-top: 60px;
+    margin-top: 40px;
+    box-shadow: 0 12px 40px 0 rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(10px);
+    transition: border-color 0.4s ease;
 }
-.welcome-card h2 { color: #ff6666; margin-bottom: 8px; }
-.welcome-card p  { color: #aaa; font-size: 1.05rem; }
+.welcome-card:hover {
+    border-color: rgba(255, 75, 75, 0.35) !important;
+}
+.welcome-card h2 {
+    font-family: 'Outfit', sans-serif;
+    color: #ff4b4b;
+    font-size: 2.3rem;
+    font-weight: 700;
+    margin-bottom: 6px;
+    letter-spacing: -0.5px;
+}
+.welcome-card .subtitle {
+    color: #ff9f1c;
+    font-size: 1.05rem;
+    font-weight: 600;
+    margin-bottom: 24px;
+    text-transform: uppercase;
+    letter-spacing: 1.8px;
+}
+.welcome-card .description {
+    color: #8892b0;
+    font-size: 1.05rem;
+    line-height: 1.6;
+    max-width: 650px;
+    margin: 0 auto 32px auto;
+}
+.features-badge-container {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 16px;
+}
+.feature-badge {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 20px;
+    padding: 6px 14px;
+    font-size: 0.85rem;
+    color: #cbd5e1;
+    font-weight: 500;
+}
+.fire-icon {
+    font-size: 3.2rem;
+    margin-bottom: 15px;
+    animation: float-pulse 2.5s infinite alternate ease-in-out;
+}
+@keyframes float-pulse {
+    0% { transform: translateY(0) scale(0.95); filter: drop-shadow(0 0 4px rgba(255, 75, 75, 0.4)); }
+    100% { transform: translateY(-6px) scale(1.05); filter: drop-shadow(0 0 16px rgba(255, 75, 75, 0.7)); }
+}
 </style>
-""", unsafe_allow_html=True)
+""")
 
 # ── Session state defaults ─────────────────────────────────────────────────────
 _defaults = {
@@ -411,83 +516,31 @@ if analyse_clicked:
             if n_hazards == 0:
                 st.info("ℹ No hazard points found — hazard weight has no effect.")
 
-            progress.progress(65, text="Calculating density grid…")
-            bh  = calculate_height_risk(buildings)
-            bho = calculate_occupancy_modifier(bh)
-            # IMPROVEMENT 4: combustibility scoring
-            bho = calculate_combustibility(bho)
-            density_grid = calculate_density_grid(bho)
-
-            # IMPROVEMENT 9: OSM data completeness flag
-            density_grid = assess_data_completeness(bho, density_grid)
-
-            progress.progress(69, text="Applying road-width modifier…")
-            density_grid = calculate_road_width_modifier(density_grid, accessible_roads)
-
-            # IMPROVEMENT 3: travel time
-            progress.progress(75, text="Calculating travel time to fire stations…")
-            bt = calculate_travel_risk(bho, fire_stations, graph, extra_station)
-
-            progress.progress(80, text="Calculating water proximity risk…")
-            bw = calculate_water_risk(bt, water_sources)
-
-            progress.progress(83, text="Calculating hazard proximity risk…")
-            ba = calculate_hazard_risk(bw, hazards)
-
-            progress.progress(86, text="Computing composite risk scores…")
-            # IMPROVEMENT 6: pass aggregation method
-            final_risk_grid = calculate_composite_risk(density_grid, ba, weights, aggregation=aggregation_method)
-            if wind_direction is not None:
-                final_risk_grid = apply_wind_modifier(final_risk_grid, wind_direction)
-
-            # IMPROVEMENT 7: Monte Carlo uncertainty
-            if run_uncertainty:
-                progress.progress(88, text="Running Monte Carlo uncertainty analysis (300 simulations)…")
-                mc_grid = monte_carlo_uncertainty(density_grid, ba, weights)
-                st.session_state.mc_grid = mc_grid
-            else:
-                st.session_state.mc_grid = None
-
-            # IMPROVEMENT 8: Moran's I spatial autocorrelation
-            progress.progress(92, text="Computing spatial autocorrelation (Moran's I)…")
-            moran_result = calculate_spatial_autocorrelation(final_risk_grid)
-            st.session_state.moran_result = moran_result
-
-            progress.progress(93, text="Rendering static maps…")
-            save_footprints_map(buildings, graph, 'building_footprints.png')
-            save_roads_map(accessible_roads, graph, 'road_network.png')
-
-            progress.progress(96, text="Generating risk heatmap…")
-            generate_static_risk_map(final_risk_grid, graph)
-
-            progress.progress(98, text="Generating interactive map…")
-            folium_map = generate_interactive_risk_map(
-                final_risk_grid, fire_stations, water_sources, extra_station, accessible_roads
+            progress.progress(65, text="Running unified fire risk analysis pipeline...")
+            analysis_results = run_analysis_pipeline(
+                location_point,
+                search_dist,
+                weights,
+                road_types=selected_road_types,
+                extra_station=extra_station,
+                wind_direction=wind_direction,
+                aggregation_method=aggregation_method,
+                run_uncertainty=run_uncertainty,
+                generate_maps=True,
+                graph=graph,
+                accessible_roads=accessible_roads,
+                buildings=buildings,
+                water_sources=water_sources,
+                fire_stations=fire_stations,
+                hazards=hazards,
             )
-            st.session_state.folium_map = folium_map
 
-            # Build recommendations
-            bc   = final_risk_grid['risk_band'].value_counts()
-            _avg = final_risk_grid['final_risk'].mean()
-            _crit = int(bc.get('Critical', 0))
-            _high = int(bc.get('High',     0))
-            _max  = final_risk_grid['final_risk'].max()
-            recs = []
-            if _crit > 0:
-                recs.append(f"⛔ **{_crit} Critical zone(s) detected.** Prioritise fire safety inspections and ensure emergency access routes are clear.")
-            if _high > 0:
-                recs.append(f"🔴 **{_high} High-risk zone(s) found.** Consider deploying additional fire hydrants or temporary water tanks.")
-            if _avg > 0.5:
-                recs.append("📍 **Overall average risk is high.** This area may benefit from a new fire station or major infrastructure review.")
-            if _max >= 0.75:
-                c1 = final_risk_grid.nlargest(1, 'final_risk').to_crs("EPSG:4326")
-                recs.append(f"🗺 **Highest-risk cell at ({c1.centroid.y.values[0]:.4f}, {c1.centroid.x.values[0]:.4f}).** Field verification recommended.")
-            if 'access_risk' in final_risk_grid.columns and final_risk_grid['access_risk'].mean() > 0.6:
-                recs.append("🚒 **Fire station access risk is high.** Road improvements or an additional station would significantly reduce response times.")
-            if 'water_risk' in final_risk_grid.columns and final_risk_grid['water_risk'].mean() > 0.6:
-                recs.append("💧 **Water source proximity is low.** Installing more hydrants or ensuring water access could reduce suppression difficulty.")
-            if not recs:
-                recs.append("✅ Risk profile is within acceptable ranges. Continue routine monitoring.")
+            final_risk_grid = analysis_results["final_risk_grid"]
+            mc_grid = analysis_results["mc_grid"]
+            st.session_state.mc_grid = mc_grid
+            moran_result = analysis_results["moran_result"]
+            st.session_state.moran_result = moran_result
+            recs = analysis_results["recs"]
 
             # Save history
             os.makedirs("history", exist_ok=True)
@@ -962,13 +1015,14 @@ ul{{line-height:2}}iframe{{width:100%;height:520px;border:none;margin-top:10px}}
                             _lpt2, 1000, tuple(DEFAULT_ROAD_TYPES), _tepsg)
                         if _bg is None or _bb.empty:
                             _batch_results.append({"Location": _loc, "Status": "No data"}); continue
-                        _bdg  = calculate_density_grid(_bb)
-                        _bbh  = calculate_occupancy_modifier(calculate_height_risk(_bb))
-                        _bdg  = calculate_road_width_modifier(_bdg, _bar)
-                        _bbt  = calculate_travel_risk(_bbh, _bfs, _bg)
-                        _bbw  = calculate_water_risk(_bbt, _bws)
-                        _bba  = calculate_hazard_risk(_bbw, _bh)
-                        _bfrg = calculate_composite_risk(_bdg, _bba, _bw)
+                        _res = run_analysis_pipeline(
+                            _lpt2, 1000, _bw,
+                            road_types=DEFAULT_ROAD_TYPES,
+                            generate_maps=False,
+                            graph=_bg, accessible_roads=_bar, buildings=_bb,
+                            water_sources=_bws, fire_stations=_bfs, hazards=_bh
+                        )
+                        _bfrg = _res["final_risk_grid"]
                         _bbc  = _bfrg['risk_band'].value_counts()
                         _batch_results.append({
                             "Location": _loc, "Buildings": len(_bb),
@@ -1021,15 +1075,25 @@ else:
     # ── Welcome screen (shown before first analysis) ───────────────────────────
     st.markdown("""
 <div class="welcome-card">
+  <div class="fire-icon">🔥</div>
   <h2>Welcome to FRAT</h2>
-  <p>Configure your location and settings in the <b>sidebar on the left</b>,<br>
-  then click <b>🔍 Analyse Location</b> to generate your fire risk report.</p>
-  <br>
-  <p style="font-size:0.9rem; color:#888;">
-    Results will appear here across 8 tabs:<br>
-    📊 Summary &nbsp;·&nbsp; 🗺 Maps &nbsp;·&nbsp; 🌍 Interactive &nbsp;·&nbsp;
-    🔥 Hotspots &nbsp;·&nbsp; 📥 Export &nbsp;·&nbsp; 📂 History &nbsp;·&nbsp;
-    📋 Batch &nbsp;·&nbsp; ⚖ Compare
+  <div class="subtitle">Fire Risk Analysis Tool</div>
+  <p class="description">
+    An advanced geospatial modeling application for evaluating fire risk profiles in urban settlements. 
+    By leveraging high-resolution OpenStreetMap (OSM) data and multi-criteria decision models, 
+    FRAT quantifies localized vulnerabilities across street networks, buildings, water resources, and hazards.
+  </p>
+  <div class="features-badge-container">
+    <span class="feature-badge">⚡ Parallel OSM Fetching</span>
+    <span class="feature-badge">🚒 Travel Time (NFPA 1710)</span>
+    <span class="feature-badge">🗺️ Road Vulnerability (NetworkX)</span>
+    <span class="feature-badge">🧬 AHP & Monte Carlo</span>
+    <span class="feature-badge">📈 Moran's I Autocorrelation</span>
+  </div>
+  <br><br>
+  <p style="font-size:0.9rem; color:#6d7894;">
+    To get started, configure your target location and parameter weights in the <b>sidebar panel on the left</b>,<br>
+    then click the <b>🔍 Analyse Location</b> button.
   </p>
 </div>
 """, unsafe_allow_html=True)
