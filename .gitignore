@@ -12,3 +12,5 @@ history/
 .env
 .DS_Store
 cache/
+.env.bat
+local_env.bat
