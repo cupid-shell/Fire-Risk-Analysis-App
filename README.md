@@ -89,13 +89,13 @@ OSM (parallel fetch) → Buildings → Height / Combustibility / Occupancy
 ## Setup
 
 ### Requirements
-- Python 3.9+
+- Python 3.10+ (Python 3.11 recommended)
 - Anaconda or Miniconda (recommended)
 
 ### Installation
 
 ```bash
-conda create --name frat_env python=3.9
+conda create --name frat_env python=3.11
 conda activate frat_env
 pip install -r requirements.txt
 ```
@@ -106,6 +106,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+On Windows, you can also double-click `run_app.bat` to launch the application.
 The app opens at `http://localhost:8501`.
 
 ---

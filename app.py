@@ -1,30 +1,31 @@
 import sys
 import os
 
-# ── DLL & Environment Bootstrap (Resolves Windows Conda DLL collisions) ───────
-_env_prefix = sys.prefix
-for _p in [
-    os.path.join(_env_prefix, 'Library', 'bin'),
-    os.path.join(_env_prefix, 'Library', 'usr', 'bin'),
-    os.path.join(_env_prefix, 'Library', 'mingw-w64', 'bin'),
-    os.path.join(_env_prefix, 'Scripts'),
-    os.path.join(_env_prefix, 'bin'),
-]:
-    if os.path.isdir(_p):
-        if hasattr(os, 'add_dll_directory'):
-            try:
-                os.add_dll_directory(_p)
-            except Exception:
-                pass
-        if _p not in os.environ.get('PATH', ''):
-            os.environ['PATH'] = _p + os.pathsep + os.environ.get('PATH', '')
+# ── Platform-specific DLL & Environment Bootstrap ─────────────────────────────
+if sys.platform == 'win32':
+    _env_prefix = sys.prefix
+    for _p in [
+        os.path.join(_env_prefix, 'Library', 'bin'),
+        os.path.join(_env_prefix, 'Library', 'usr', 'bin'),
+        os.path.join(_env_prefix, 'Library', 'mingw-w64', 'bin'),
+        os.path.join(_env_prefix, 'Scripts'),
+        os.path.join(_env_prefix, 'bin'),
+    ]:
+        if os.path.isdir(_p):
+            if hasattr(os, 'add_dll_directory'):
+                try:
+                    os.add_dll_directory(_p)
+                except Exception:
+                    pass
+            if _p not in os.environ.get('PATH', ''):
+                os.environ['PATH'] = _p + os.pathsep + os.environ.get('PATH', '')
 
-_gdal_data = os.path.join(_env_prefix, 'Library', 'share', 'gdal')
-if os.path.isdir(_gdal_data) and 'GDAL_DATA' not in os.environ:
-    os.environ['GDAL_DATA'] = _gdal_data
-_proj_data = os.path.join(_env_prefix, 'Library', 'share', 'proj')
-if os.path.isdir(_proj_data) and 'PROJ_LIB' not in os.environ:
-    os.environ['PROJ_LIB'] = _proj_data
+    _gdal_data = os.path.join(_env_prefix, 'Library', 'share', 'gdal')
+    if os.path.isdir(_gdal_data) and 'GDAL_DATA' not in os.environ:
+        os.environ['GDAL_DATA'] = _gdal_data
+    _proj_data = os.path.join(_env_prefix, 'Library', 'share', 'proj')
+    if os.path.isdir(_proj_data) and 'PROJ_LIB' not in os.environ:
+        os.environ['PROJ_LIB'] = _proj_data
 
 # Ensure headless Agg backend to prevent Qt GUI threading / window crashes
 import matplotlib
