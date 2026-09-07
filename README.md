@@ -159,4 +159,4 @@ The app opens at `http://localhost:8501`.
 ## Author
 
 Avishek Adhikari
-avishek.jidpus@gmail.com
+avishek.ges@gmail.com
