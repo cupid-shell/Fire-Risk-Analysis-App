@@ -1,3 +1,35 @@
+import sys
+import os
+
+# ── DLL & Environment Bootstrap (Resolves Windows Conda DLL collisions) ───────
+_env_prefix = sys.prefix
+for _p in [
+    os.path.join(_env_prefix, 'Library', 'bin'),
+    os.path.join(_env_prefix, 'Library', 'usr', 'bin'),
+    os.path.join(_env_prefix, 'Library', 'mingw-w64', 'bin'),
+    os.path.join(_env_prefix, 'Scripts'),
+    os.path.join(_env_prefix, 'bin'),
+]:
+    if os.path.isdir(_p):
+        if hasattr(os, 'add_dll_directory'):
+            try:
+                os.add_dll_directory(_p)
+            except Exception:
+                pass
+        if _p not in os.environ.get('PATH', ''):
+            os.environ['PATH'] = _p + os.pathsep + os.environ.get('PATH', '')
+
+_gdal_data = os.path.join(_env_prefix, 'Library', 'share', 'gdal')
+if os.path.isdir(_gdal_data) and 'GDAL_DATA' not in os.environ:
+    os.environ['GDAL_DATA'] = _gdal_data
+_proj_data = os.path.join(_env_prefix, 'Library', 'share', 'proj')
+if os.path.isdir(_proj_data) and 'PROJ_LIB' not in os.environ:
+    os.environ['PROJ_LIB'] = _proj_data
+
+# Ensure headless Agg backend to prevent Qt GUI threading / window crashes
+import matplotlib
+matplotlib.use('Agg')
+
 import streamlit as st
 from geopy.geocoders import Nominatim
 import streamlit.components.v1 as components
@@ -5,7 +37,7 @@ from streamlit_folium import st_folium as _st_folium
 import geopandas as gpd
 from shapely.geometry import Point
 import pandas as pd
-import json, os, io, zipfile, datetime
+import json, os, io, zipfile, datetime, time
 from concurrent.futures import ThreadPoolExecutor
 
 from fire_risk_analyzer import (
@@ -429,7 +461,8 @@ def fetch_all_osm_parallel(location_point, distance, road_types_tuple, target_ep
             return h.to_crs(target_epsg)
         except: return gpd.GeoDataFrame(columns=['geometry'], crs=target_epsg)
 
-    with ThreadPoolExecutor(max_workers=5) as ex:
+    # Limit to 2 concurrent workers to respect OpenStreetMap Overpass API limits
+    with ThreadPoolExecutor(max_workers=2) as ex:
         fg = ex.submit(_graph)
         fb = ex.submit(_buildings)
         fw = ex.submit(_water)
@@ -738,20 +771,17 @@ if st.session_state.maps_generated and st.session_state.final_risk_grid is not N
         _es = st.session_state.get('last_extra_station')
         _ar = st.session_state.last_accessible_roads
 
-        generate_interactive_risk_map(frg, _fs, _ws, _es, _ar, show_layers=_show_layers)
-
-        with open('interactive_risk_map.html', 'r', encoding='utf-8') as _f:
-            _map_html = _f.read()
+        _folium_map = generate_interactive_risk_map(frg, _fs, _ws, _es, _ar, show_layers=_show_layers)
+        _map_html = _folium_map.get_root().render()
         components.html(_map_html, height=580, scrolling=True)
 
         # Download button
-        with open('interactive_risk_map.html', 'rb') as _ff:
-            st.download_button(
-                "🔲 Download Map for Fullscreen View",
-                data=_ff.read(),
-                file_name="fire_risk_interactive_map.html",
-                mime="text/html",
-            )
+        st.download_button(
+            "🔲 Download Map for Fullscreen View",
+            data=_map_html.encode('utf-8'),
+            file_name="fire_risk_interactive_map.html",
+            mime="text/html",
+        )
 
         # Click-to-place: small dedicated st_folium map
         st.markdown("---")
@@ -843,7 +873,36 @@ if st.session_state.maps_generated and st.session_state.final_risk_grid is not N
                     import tempfile, shutil
                     _td = tempfile.mkdtemp()
                     _sp = os.path.join(_td, "risk_grid")
-                    frg.to_crs("EPSG:4326").to_file(_sp + ".shp")
+                    _shp_gdf = frg.to_crs("EPSG:4326").copy()
+
+                    # DBF 10-character limit column mapping
+                    _col_map = {
+                        'n_buildings': 'n_bldgs',
+                        'total_gfa': 'tot_gfa',
+                        'avg_combustibility': 'combust',
+                        'completeness_score': 'cmpl_scr',
+                        'total_footprint_area': 'tot_fp_m2',
+                        'coverage_ratio': 'cov_ratio',
+                        'data_warning': 'data_warn',
+                        'avg_lanes': 'avg_lanes',
+                        'network_vulnerability': 'net_vuln',
+                        'avg_travel_time': 'trav_time',
+                        'avg_distance_water': 'dist_water',
+                        'avg_hazard_score': 'haz_score',
+                        'density_risk': 'dens_risk',
+                        'access_risk': 'acc_risk',
+                        'water_risk': 'wat_risk',
+                        'height_risk': 'hgt_risk',
+                        'hazard_risk': 'haz_risk',
+                        'final_risk': 'fin_risk',
+                        'risk_band': 'risk_band',
+                        'is_vacant': 'is_vacant',
+                    }
+                    _shp_gdf = _shp_gdf.rename(columns={k: v for k, v in _col_map.items() if k in _shp_gdf.columns})
+                    if 'jenks_breaks' in _shp_gdf.columns:
+                        _shp_gdf = _shp_gdf.drop(columns=['jenks_breaks'])
+
+                    _shp_gdf.to_file(_sp + ".shp")
                     for _ext in ['.shp','.shx','.dbf','.prj','.cpg']:
                         _fp = _sp + _ext
                         if os.path.exists(_fp):
@@ -1005,6 +1064,8 @@ ul{{line-height:2}}iframe{{width:100%;height:520px;border:none;margin-top:10px}}
                 for _i, _loc in enumerate(_locations):
                     try:
                         _bp.progress(int((_i / len(_locations)) * 100), text=f"Analysing {_loc}…")
+                        if _i > 0:
+                            time.sleep(1.0)  # Respect Nominatim 1 req/sec policy to avoid IP ban
                         _gl = _geo.geocode(_loc)
                         if not _gl:
                             _batch_results.append({"Location": _loc, "Status": "Not found"}); continue

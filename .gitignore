@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.class
+.pytest_cache/
+*.png
+*.html
+*.geojson
+*.csv
+*.zip
+*.kmz
+history/
+.env
+.DS_Store
+cache/

@@ -11,6 +11,9 @@ from fire_risk_analyzer import (
     calculate_density_grid,
     calculate_composite_risk,
     calculate_combustibility,
+    calculate_travel_risk,
+    classify_risk_bands,
+    monte_carlo_uncertainty,
 )
 
 def test_ahp_weights():
@@ -160,3 +163,98 @@ def test_run_analysis_pipeline():
     grid = res["final_risk_grid"]
     assert 'final_risk' in grid.columns
     assert 'risk_band' in grid.columns
+    assert 'is_vacant' in grid.columns
+
+def test_classify_risk_bands_low_variance():
+    """Verify that classify_risk_bands handles degenerate / uniform scores without ValueError."""
+    # Create a grid where all cells have the exact same score
+    cell1 = Polygon([(0, 0), (50, 0), (50, 50), (0, 50)])
+    cell2 = Polygon([(50, 0), (100, 0), (100, 50), (50, 50)])
+    grid = gpd.GeoDataFrame({'final_risk': [0.20, 0.20]}, geometry=[cell1, cell2], crs="EPSG:32646")
+
+    # This previously could fail with ValueError in jenkspy; now it falls back gracefully
+    classified = classify_risk_bands(grid, n_classes=4)
+    assert 'risk_band' in classified.columns
+    assert (classified['risk_band'] == 'Low').all()
+
+def test_calculate_travel_risk_multi_source():
+    """Verify multi-source Dijkstra resolves shortest paths across multiple stations and disconnected nodes."""
+    b1 = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+    b2 = Polygon([(100, 100), (110, 100), (110, 110), (100, 110)])
+    buildings = gpd.GeoDataFrame(geometry=[b1, b2], crs="EPSG:32646")
+
+    stations = gpd.GeoDataFrame(
+        {'amenity': ['fire_station']},
+        geometry=[Point(-10, -10)],
+        crs="EPSG:32646"
+    )
+
+    g = nx.MultiDiGraph(crs="EPSG:32646")
+    g.add_node(1, x=5.0, y=5.0)       # b1
+    g.add_node(2, x=-10.0, y=-10.0)   # station
+    g.add_node(3, x=105.0, y=105.0)   # b2 (disconnected)
+
+    # Edge from station to b1
+    g.add_edge(2, 1, key=0, highway='residential', travel_time=25.0)
+
+    res = calculate_travel_risk(buildings, stations, g)
+    assert 'travel_time' in res.columns
+    # b1 is connected (travel time 25.0)
+    assert res.iloc[0]['travel_time'] == 25.0
+    # b2 is disconnected (should fallback to default max 480.0)
+    assert res.iloc[1]['travel_time'] == 480.0
+
+def test_empty_cell_vacant_handling():
+    """Verify that cells with no buildings are flagged is_vacant=True and have zero built fire risk."""
+    cell1 = Polygon([(0, 0), (50, 0), (50, 50), (0, 50)])
+    cell2 = Polygon([(50, 0), (100, 0), (100, 50), (50, 50)])
+    density_grid = gpd.GeoDataFrame(
+        {'n_buildings': [1, 0]},
+        geometry=[cell1, cell2],
+        crs="EPSG:32646"
+    )
+
+    # Building in cell 1 only
+    b1 = Polygon([(10, 10), (20, 10), (20, 20), (10, 20)])
+    buildings = gpd.GeoDataFrame(
+        {'travel_time': [60.0], 'distance_to_water': [100.0]},
+        geometry=[b1],
+        crs="EPSG:32646"
+    )
+
+    weights = {"density": 0.3, "access": 0.3, "water": 0.4}
+    res = calculate_composite_risk(density_grid, buildings, weights)
+
+    assert 'is_vacant' in res.columns
+    assert not res.iloc[0]['is_vacant']
+    assert res.iloc[1]['is_vacant']
+    # Occupied cell has computed risk
+    assert res.iloc[0]['final_risk'] > 0
+    # Vacant cell has 0 built risk
+    assert res.iloc[1]['final_risk'] == 0.0
+
+def test_monte_carlo_uncertainty():
+    """Verify vectorized monte_carlo_uncertainty runs rapidly and outputs mean and std per cell."""
+    cell1 = Polygon([(0, 0), (50, 0), (50, 50), (0, 50)])
+    density_grid = gpd.GeoDataFrame(
+        {'n_buildings': [2], 'total_gfa': [200.0], 'avg_lanes': [2.0]},
+        geometry=[cell1],
+        crs="EPSG:32646"
+    )
+    b1 = Polygon([(10, 10), (20, 10), (20, 20), (10, 20)])
+    buildings = gpd.GeoDataFrame(
+        {'travel_time': [100.0], 'distance_to_water': [150.0], 'levels': [2], 'combustibility': [0.5]},
+        geometry=[b1],
+        crs="EPSG:32646"
+    )
+    weights = {"density": 0.3, "access": 0.3, "water": 0.2, "height": 0.1, "hazard": 0.1}
+    mc = monte_carlo_uncertainty(density_grid, buildings, weights, n_simulations=100)
+
+    assert not mc.empty
+    assert 'risk_mean' in mc.columns
+    assert 'risk_std' in mc.columns
+    assert 'risk_cv' in mc.columns
+    assert mc.iloc[0]['risk_mean'] > 0.0
+    assert 0.0 <= mc.iloc[0]['risk_cv'] <= 1.0
+
+
